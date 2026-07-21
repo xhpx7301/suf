@@ -837,7 +837,7 @@ EOF
   fi
   ensure_fail2ban_running
   ok "Fail2ban SSH 防护已启用。"
-  fail2ban-client status sshd || true
+  show_fail2ban_sshd_status
 }
 
 require_fail2ban() {
@@ -872,15 +872,62 @@ install_fail2ban_service() {
   ok "Fail2ban 已安装并启动。下一步请配置 SSH 防护规则。"
 }
 
-show_fail2ban_status() {
-  if command -v fail2ban-client >/dev/null 2>&1; then
-    printf '服务状态：%s\n' "$(systemctl is-active fail2ban 2>/dev/null || true)"
-    fail2ban-client status || true
-    printf '\nSSH 防护规则：\n'
-    fail2ban-client status sshd 2>/dev/null || printf '  SSH 防护规则尚未启用。\n'
-  else
-    printf 'Fail2ban：未安装\n'
+fail2ban_status_value() {
+  local status=$1 label=$2
+  awk -v label="$label" '
+    index($0, label ":") {
+      value = substr($0, index($0, label ":") + length(label) + 1)
+      sub(/^[[:space:]]+/, "", value)
+      print value
+      exit
+    }
+  ' <<<"$status"
+}
+
+show_fail2ban_sshd_status() {
+  local status current_failed total_failed current_banned total_banned banned_ips
+  if ! status=$(fail2ban-client status sshd 2>/dev/null); then
+    printf 'SSH 防护规则：尚未启用。\n'
+    return
   fi
+
+  current_failed=$(fail2ban_status_value "$status" 'Currently failed')
+  total_failed=$(fail2ban_status_value "$status" 'Total failed')
+  current_banned=$(fail2ban_status_value "$status" 'Currently banned')
+  total_banned=$(fail2ban_status_value "$status" 'Total banned')
+  banned_ips=$(fail2ban_status_value "$status" 'Banned IP list')
+
+  printf 'SSH 防护规则（sshd）\n'
+  printf '  当前失败次数：%s\n' "${current_failed:-0}"
+  printf '  累计失败次数：%s\n' "${total_failed:-0}"
+  printf '  当前封禁数量：%s\n' "${current_banned:-0}"
+  printf '  累计封禁数量：%s\n' "${total_banned:-0}"
+  printf '  已封禁 IP：%s\n' "${banned_ips:-无}"
+  printf '  日志来源：systemd SSH 日志\n'
+}
+
+show_fail2ban_status() {
+  local state status jail_list
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    printf 'Fail2ban：未安装\n'
+    return
+  fi
+
+  state=$(systemctl is-active fail2ban 2>/dev/null || true)
+  case "$state" in
+    active) printf '服务状态：运行中\n' ;;
+    inactive) printf '服务状态：已停止\n' ;;
+    failed) printf '服务状态：启动失败\n' ;;
+    *) printf '服务状态：%s\n' "${state:-未知}" ;;
+  esac
+
+  if [[ $state != active ]] || ! status=$(fail2ban-client status 2>/dev/null); then
+    printf '防护规则：服务未运行，无法读取。\n'
+    return
+  fi
+  jail_list=$(fail2ban_status_value "$status" 'Jail list')
+  printf '已启用防护规则：%s\n\n' "${jail_list:-无}"
+  show_fail2ban_sshd_status
 }
 
 reload_fail2ban_service() {
@@ -1084,12 +1131,7 @@ show_status() {
   fi
 
   printf '\nFail2ban：\n'
-  if command -v fail2ban-client >/dev/null 2>&1; then
-    systemctl is-active fail2ban || true
-    fail2ban-client status sshd 2>/dev/null || true
-  else
-    printf '  未安装\n'
-  fi
+  show_fail2ban_status
 }
 
 all_in_one() {
