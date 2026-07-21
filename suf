@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.0"
+APP_VERSION="1.2.1"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 SSH_MAIN="/etc/ssh/sshd_config"
@@ -266,6 +266,7 @@ install_public_key() {
 
   printf '\n请在自己的电脑生成密钥（私钥不要上传服务器或 GitHub）：\n'
   printf '  ssh-keygen -t ed25519 -a 100\n\n'
+  read -r -p "确认已在非本服务器生成公钥后按 Enter 继续：" _
   read -r -p "粘贴 id_ed25519.pub 的完整单行内容：" public_key
   validate_public_key "$public_key" || die "公钥无效；仅接受 Ed25519 公钥。"
 
@@ -1286,8 +1287,9 @@ show_security_setup_preview() {
   cat <<'EOF'
 安全初始化向导将执行以下步骤：
 
-  1. 安装公钥，并要求在第二个终端验证密钥登录。
-  2. 选择 SSH 端口；请先在云安全组放行该端口。
+  1. 在非本服务器生成密钥对，上传公钥并安装；
+     完成后要求在第二个终端验证密钥登录。
+  2. 修改新的 SSH 端口；请先在云安全组放行该端口。
   3. 显示当前监听端口，安装并启用 UFW。
      新 SSH 端口和当前 SSH 端口会自动放行。
   4. 启用仅密钥 SSH 登录，并在修改前备份配置。
