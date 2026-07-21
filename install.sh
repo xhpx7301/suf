@@ -4,6 +4,17 @@ set -Eeuo pipefail
 TARGET="/usr/local/sbin/suf"
 LINK="/usr/local/bin/suf"
 BACKUP_DIR="/var/backups/suf/installer"
+NO_LAUNCH=0
+
+case "${1:-}" in
+  "") ;;
+  --no-launch) NO_LAUNCH=1 ;;
+  *)
+    printf '[FAIL] 未知参数：%s\n' "$1" >&2
+    printf '用法：sudo bash install.sh [--no-launch]\n' >&2
+    exit 2
+    ;;
+esac
 
 die() {
   printf '[FAIL] %s\n' "$*" >&2
@@ -49,3 +60,8 @@ ln -sfn "$TARGET" "$LINK"
 
 printf '[ OK ] 已安装 %s\n' "$($TARGET --version)"
 printf '[ OK ] 现在可以执行：suf\n'
+
+if ((NO_LAUNCH == 0)) && [[ -t 0 && -t 1 ]]; then
+  printf '[INFO] 正在打开 SUF 菜单...\n'
+  exec "$TARGET"
+fi

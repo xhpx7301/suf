@@ -27,16 +27,31 @@ SUF 本身不是常驻服务。它只在执行命令时运行，适合资源有�
 
 脚本不会修改云厂商安全组。修改 SSH 端口前，必须先在云控制台放行新端口。
 
-## 安装
+## 快捷安装
 
-克隆仓库后先阅读脚本，再执行安装：
+一条命令完成克隆、安装并打开 SUF 菜单：
 
 ```bash
-git clone https://github.com/xhpx7301/suf.git
+git clone --depth 1 https://github.com/xhpx7301/suf.git && sudo bash suf/install.sh
+```
+
+安装完成后会自动进入菜单。以后随时执行 `suf` 即可重新打开。
+
+如果当前目录已经存在 `suf` 文件夹，请进入该目录执行更新流程，不要重复克隆。
+
+## 审查后安装
+
+安全敏感的生产服务器建议先查看代码：
+
+```bash
+git clone --depth 1 https://github.com/xhpx7301/suf.git
 cd suf
-less suf install.sh
+less suf
+less install.sh
 sudo bash ./install.sh
 ```
+
+`less` 只是源码查看器，不是安装界面。按 `q` 退出后，再执行安装命令。
 
 安装程序会：
 
@@ -45,13 +60,19 @@ sudo bash ./install.sh
 3. 安装主程序到 `/usr/local/sbin/suf`。
 4. 创建 `/usr/local/bin/suf` 命令链接。
 
-安装完成后，直接执行：
+安装后重新打开菜单：
 
 ```bash
 suf
 ```
 
 普通用户执行时，SUF 会通过 `sudo` 请求管理员权限，然后打开菜单。
+
+自动化安装但不立即打开菜单：
+
+```bash
+sudo bash ./install.sh --no-launch
+```
 
 ## 命令
 
@@ -104,7 +125,7 @@ ssh-keygen -t ed25519 -a 100
 ```bash
 git pull --ff-only
 git diff HEAD@{1} -- suf install.sh
-sudo bash ./install.sh
+sudo bash ./install.sh --no-launch
 ```
 
 安装程序会先备份当前已安装版本。
