@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.1.1"
+APP_VERSION="1.1.2"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 SSH_MAIN="/etc/ssh/sshd_config"
@@ -703,7 +703,7 @@ configure_fail2ban() {
   local default_port ssh_port maxretry findtime bantime
   local jail_file=/etc/fail2ban/jail.d/suf.local
   local backup_file=""
-  apt_install fail2ban
+  apt_install fail2ban python3-systemd
   ensure_openssh
   default_port=$(current_ssh_port)
   ssh_port=$(prompt_port "$default_port")
@@ -771,7 +771,7 @@ ensure_fail2ban_running() {
 }
 
 install_fail2ban_service() {
-  apt_install fail2ban
+  apt_install fail2ban python3-systemd
   systemctl enable fail2ban
   systemctl reset-failed fail2ban || true
   if ! systemctl start fail2ban; then
@@ -1016,7 +1016,7 @@ all_in_one() {
   read -r -p "完成后输入 FIREWALL-READY：" confirmation
   [[ $confirmation == FIREWALL-READY ]] || die "未确认云防火墙，取消操作。"
 
-  apt_install ufw fail2ban
+  apt_install ufw fail2ban python3-systemd
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow "${target_port}/tcp" comment 'SUF SSH 管理'
