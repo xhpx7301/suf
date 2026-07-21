@@ -99,7 +99,7 @@ suf --help          # 查看帮助
 ## 菜单结构
 
 ```text
-SUF 1.2.1 - Server UFW & SSH Fortress
+SUF 1.2.2 - Server UFW & SSH Fortress
 
 （1）SSH 与密钥管理
 （2）UFW 防火墙管理
@@ -129,7 +129,7 @@ SUF 1.2.1 - Server UFW & SSH Fortress
 | --- | --- |
 | `1` 查看 SSH 状态与安全配置 | 显示实际生效的端口、root 登录策略及密码认证状态。配置后优先用它核对。 |
 | `2` 安装/修复 OpenSSH 服务 | 安装并启动 OpenSSH；不会移除现有 SSH 配置。 |
-| `3` 为登录用户安装公钥 | 先在自己的电脑执行 `ssh-keygen -t ed25519 -a 100`，确认后再粘贴 `id_ed25519.pub` 公钥。默认写入 `/root/.ssh/authorized_keys`；绝不能上传私钥。 |
+| `3` 为登录用户安装公钥 | 先在用于登录服务器的电脑上执行 `ssh-keygen -t ed25519 -a 100`，不要在服务器上生成；确认后再粘贴 `id_ed25519.pub` 公钥。默认写入 `/root/.ssh/authorized_keys`；绝不能上传私钥。 |
 | `4` 启用仅密钥登录 | 禁用 SSH 密码和键盘交互认证，保留当前端口。必须先在第二个终端验证密钥登录；确认输入 `y`，直接回车视为否。 |
 | `5` 修改 SSH 端口 | 仅修改 SSH 端口，不改变密码或密钥认证策略。必须先在云安全组放行新端口，SUF 会放行对应 UFW 规则。 |
 | `6` 校验并重新加载 SSH | 对配置执行语法校验后重载 SSH。适合手动修改 SSH 配置后使用。 |
