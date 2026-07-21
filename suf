@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.0.0"
+APP_VERSION="1.1.0"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 SSH_MAIN="/etc/ssh/sshd_config"
@@ -37,7 +37,7 @@ pause() {
 
 confirm() {
   local prompt=$1 answer
-  read -r -p "${prompt} [y/N] " answer
+  read -r -p "${prompt} [y/N，默认 N] " answer
   [[ ${answer:-n} =~ ^[Yy]$ ]]
 }
 
@@ -181,7 +181,9 @@ ensure_admin_user() {
   local target_user=$1
 
   [[ $target_user =~ ^[a-z_][a-z0-9_-]*$ ]] || die "用户名格式无效。"
-  [[ $target_user != root ]] || die "运维账号不能是 root。"
+  if [[ $target_user == root ]]; then
+    return
+  fi
 
   if ! id "$target_user" >/dev/null 2>&1; then
     info "创建运维账号 ${target_user}。请为 sudo 设置一个强本地密码。"
@@ -210,8 +212,9 @@ validate_public_key() {
 install_public_key() {
   local target_user home ssh_dir auth_file public_key key_type key_body fingerprint
 
-  read -r -p "目标运维用户名 [ops]：" target_user
-  target_user=${target_user:-ops}
+  printf '\n默认给 root 安装公钥，可直接获得完整管理权限；输入其他用户名则创建普通 sudo 管理员。\n'
+  read -r -p "密钥登录用户名 [root]：" target_user
+  target_user=${target_user:-root}
   ensure_admin_user "$target_user"
 
   home=$(user_home "$target_user")
@@ -249,9 +252,13 @@ install_public_key() {
   fingerprint=$(printf '%s\n' "$public_key" | ssh-keygen -lf - | awk '{print $2}')
   LAST_CONFIGURED_USER=$target_user
   printf '账号：%s\n指纹：%s\n' "$target_user" "$fingerprint"
-  printf '\n请保持当前 SSH 会话不关闭，并在第二个终端测试：\n'
+  printf '\n请保持当前 SSH 会话不关闭，并在第二个终端测试密钥登录：\n'
   printf '  ssh -p %s %s@服务器IP\n' "$(current_ssh_port)" "$target_user"
-  printf '登录后还要执行：sudo -v\n'
+  if [[ $target_user == root ]]; then
+    printf '登录后执行 whoami，输出必须是 root。\n'
+  else
+    printf '登录后执行 sudo -v，确认该用户可以提权。\n'
+  fi
 }
 
 backup_ssh_config() {
@@ -300,24 +307,44 @@ authorized_key_count() {
   home=$(user_home "$target_user")
   auth_file="${home}/.ssh/authorized_keys"
   [[ -r $auth_file ]] || { printf '0\n'; return; }
-  awk '$1 ~ /^(ssh-ed25519|sk-ssh-ed25519@openssh.com)$/ && $2 != "" { count++ } END { print count+0 }' "$auth_file"
+  awk '
+    {
+      for (i = 1; i < NF; i++) {
+        if ($i ~ /^(ssh-ed25519|sk-ssh-ed25519@openssh.com)$/ && $(i + 1) != "") {
+          count++
+          break
+        }
+      }
+    }
+    END { print count+0 }
+  ' "$auth_file"
 }
 
 require_tested_key_login() {
   local target_user=$1 confirmation count
-  [[ $target_user != root ]] || die "必须使用非 root 运维账号。"
   id "$target_user" >/dev/null 2>&1 || die "账号 ${target_user} 不存在。"
-  user_has_sudo "$target_user" || die "账号 ${target_user} 没有 sudo 权限。"
+  if [[ $target_user != root ]]; then
+    user_has_sudo "$target_user" || die "账号 ${target_user} 没有 sudo 权限。"
+  fi
   count=$(authorized_key_count "$target_user")
   ((count > 0)) || die "账号 ${target_user} 没有有效的 Ed25519 authorized_keys。"
 
-  warn "只有在第二个终端已用 ${target_user} 的密钥登录并成功执行 sudo -v 后才能继续。"
+  if [[ $target_user == root ]]; then
+    warn "只有在第二个终端已用 root 密钥登录，并确认 whoami 输出 root 后才能继续。"
+  else
+    warn "只有在第二个终端已用 ${target_user} 的密钥登录并成功执行 sudo -v 后才能继续。"
+  fi
   read -r -p "确认已完成测试请输入 TESTED：" confirmation
   [[ $confirmation == TESTED ]] || die "未确认测试，取消 SSH 加固。"
 }
 
 write_sshd_hardening() {
-  local port=$1 target_user=$2 backup_dir effective
+  local port=$1 target_user=$2 backup_dir effective permit_root effective_root
+  if [[ $target_user == root ]]; then
+    permit_root='prohibit-password'
+  else
+    permit_root='no'
+  fi
   backup_dir=$(backup_ssh_config)
   mkdir -p "$SSH_DROPIN_DIR"
 
@@ -331,7 +358,7 @@ KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 PermitEmptyPasswords no
 AuthenticationMethods publickey
-PermitRootLogin no
+PermitRootLogin ${permit_root}
 MaxAuthTries 3
 LoginGraceTime 30
 EOF
@@ -351,8 +378,7 @@ EOF
     "pubkeyauthentication yes" \
     "passwordauthentication no" \
     "kbdinteractiveauthentication no" \
-    "authenticationmethods publickey" \
-    "permitrootlogin no"; do
+    "authenticationmethods publickey"; do
     if ! grep -qx "$expected" <<<"$effective"; then
       warn "最终 SSH 配置未生效：${expected}，正在自动恢复。"
       restore_ssh_backup "$backup_dir"
@@ -361,14 +387,34 @@ EOF
     fi
   done
 
+  effective_root=$(awk '$1 == "permitrootlogin" {print $2; exit}' <<<"$effective")
+  if [[ $target_user == root ]]; then
+    if [[ $effective_root != prohibit-password && $effective_root != without-password ]]; then
+      warn "Root 密钥登录策略未生效，正在自动恢复。"
+      restore_ssh_backup "$backup_dir"
+      "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
+      die "没有应用任何 SSH 变更。"
+    fi
+  elif [[ $effective_root != no ]]; then
+    warn "禁止 Root 登录的策略未生效，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
+    die "没有应用任何 SSH 变更。"
+  fi
+
   if ! systemctl reload "$SSH_SERVICE"; then
-    warn "SSH reload 失败，正在自动恢复。"
+    warn "SSH 配置重新加载失败，正在自动恢复。"
     restore_ssh_backup "$backup_dir"
     "$SSHD_BIN" -t && systemctl reload "$SSH_SERVICE" || die "自动恢复失败；不要关闭当前 SSH 会话。"
     die "SSH 变更已撤销。"
   fi
 
-  ok "SSH 已加固，备份位于 ${backup_dir}。"
+  if [[ $target_user == root ]]; then
+    ok "SSH 已设置为 root 仅密钥登录，所有密码认证均已禁止。"
+  else
+    ok "SSH 已设置为 ${target_user} 仅密钥登录，Root 登录和所有密码认证均已禁止。"
+  fi
+  info "原 SSH 配置备份位于 ${backup_dir}。"
   printf '\n不要关闭当前会话。请立即在第三个终端测试：\n'
   printf '  ssh -p %s %s@服务器IP\n' "$port" "$target_user"
 }
@@ -377,11 +423,12 @@ configure_ssh_hardening() {
   local current_port target_port target_user
   ensure_openssh
   current_port=$(current_ssh_port)
-  read -r -p "已验证密钥登录的非 root 用户名 [ops]：" target_user
-  target_user=${target_user:-ops}
+  read -r -p "已验证密钥登录的用户名 [root]：" target_user
+  target_user=${target_user:-root}
   require_tested_key_login "$target_user"
   target_port=$(prompt_port "$current_port")
 
+  warn "应用后将禁止所有 SSH 密码和键盘交互认证，只保留公钥登录。"
   warn "请先确认云厂商安全组已放行 TCP/${target_port}。"
   confirm "已经放行或服务器没有外部安全组吗？" || die "取消操作。"
 
@@ -669,15 +716,15 @@ require_fail2ban() {
 install_fail2ban_service() {
   apt_install fail2ban
   systemctl enable --now fail2ban
-  ok "Fail2ban 已安装并启动。下一步请配置 SSH jail。"
+  ok "Fail2ban 已安装并启动。下一步请配置 SSH 防护规则。"
 }
 
 show_fail2ban_status() {
   if command -v fail2ban-client >/dev/null 2>&1; then
     printf '服务状态：%s\n' "$(systemctl is-active fail2ban 2>/dev/null || true)"
     fail2ban-client status || true
-    printf '\nSSH jail：\n'
-    fail2ban-client status sshd 2>/dev/null || printf '  sshd jail 尚未启用。\n'
+    printf '\nSSH 防护规则：\n'
+    fail2ban-client status sshd 2>/dev/null || printf '  SSH 防护规则尚未启用。\n'
   else
     printf 'Fail2ban：未安装\n'
   fi
@@ -733,16 +780,79 @@ restore_latest_ssh_backup() {
   warn "将恢复最新备份：${backup_dir}"
   confirm "确认恢复吗？" || die "取消操作。"
   restore_ssh_backup "$backup_dir"
-  "$SSHD_BIN" -t || die "备份配置校验失败，未 reload SSH。"
+  "$SSHD_BIN" -t || die "备份配置校验失败，未重新加载 SSH。"
   systemctl reload "$SSH_SERVICE"
   ok "已恢复 ${backup_dir}。请保持当前会话并测试新连接。"
 }
 
 show_ssh_status() {
-  local sshd_bin ssh_service
+  local sshd_bin ssh_service service_state service_state_cn config root_config
+  local port login_grace max_auth root_login pubkey password kbd auth_methods
+  local root_text pubkey_text password_text kbd_text auth_text summary
   if sshd_bin=$(find_sshd_bin 2>/dev/null) && ssh_service=$(find_ssh_service 2>/dev/null); then
-    printf 'SSH 服务：%s (%s)\n' "$ssh_service" "$(systemctl is-active "$ssh_service" 2>/dev/null || true)"
-    "$sshd_bin" -T 2>/dev/null | awk '$1 ~ /^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|permitrootlogin|maxauthtries|logingracetime)$/ {print "  "$0}'
+    service_state=$(systemctl is-active "$ssh_service" 2>/dev/null || true)
+    case "$service_state" in
+      active) service_state_cn='运行中' ;;
+      inactive) service_state_cn='已停止' ;;
+      failed) service_state_cn='启动失败' ;;
+      activating) service_state_cn='正在启动' ;;
+      deactivating) service_state_cn='正在停止' ;;
+      *) service_state_cn=${service_state:-未知} ;;
+    esac
+
+    config=$("$sshd_bin" -T 2>/dev/null) || die "无法读取 SSH 生效配置。"
+    root_config=$("$sshd_bin" -T -C "user=root,host=$(hostname),addr=127.0.0.1" 2>/dev/null) || root_config=$config
+
+    port=$(awk '$1 == "port" {print $2; exit}' <<<"$config")
+    login_grace=$(awk '$1 == "logingracetime" {print $2; exit}' <<<"$config")
+    max_auth=$(awk '$1 == "maxauthtries" {print $2; exit}' <<<"$config")
+    pubkey=$(awk '$1 == "pubkeyauthentication" {print $2; exit}' <<<"$config")
+    password=$(awk '$1 == "passwordauthentication" {print $2; exit}' <<<"$config")
+    kbd=$(awk '$1 == "kbdinteractiveauthentication" {print $2; exit}' <<<"$config")
+    auth_methods=$(awk '$1 == "authenticationmethods" {print $2; exit}' <<<"$config")
+    root_login=$(awk '$1 == "permitrootlogin" {print $2; exit}' <<<"$root_config")
+
+    case "$root_login" in
+      no) root_text='已禁止' ;;
+      prohibit-password|without-password) root_text='仅允许密钥（符合默认模式）' ;;
+      forced-commands-only) root_text='仅允许强制命令（受限）' ;;
+      yes) root_text='未限制（风险，取决于其他认证设置）' ;;
+      *) root_text="${root_login:-未知}" ;;
+    esac
+    [[ $pubkey == yes ]] && pubkey_text='已启用' || pubkey_text='未启用（风险）'
+    [[ $password == no ]] && password_text='已禁止（安全）' || password_text='允许（建议关闭）'
+    [[ $kbd == no ]] && kbd_text='已禁止（安全）' || kbd_text='允许（建议关闭）'
+    case "$auth_methods" in
+      publickey) auth_text='仅允许公钥' ;;
+      any) auth_text='任意可用认证方式' ;;
+      *) auth_text=${auth_methods:-未知} ;;
+    esac
+
+    if [[ $service_state != active ]]; then
+      summary='SSH 服务未正常运行'
+    elif [[ ($root_login == no || $root_login == prohibit-password || $root_login == without-password) && $pubkey == yes && $password == no && $kbd == no && $auth_methods == publickey ]]; then
+      if [[ $root_login == prohibit-password || $root_login == without-password ]]; then
+        summary='Root 仅可使用密钥登录，所有密码认证均已禁止'
+      else
+        summary='Root 登录已禁止，所有密码认证均已禁止'
+      fi
+    else
+      summary='存在未加固项目，请检查标注为“风险”或“建议关闭”的设置'
+    fi
+
+    printf 'SSH 服务状态\n'
+    printf '  服务名称：%s\n' "$ssh_service"
+    printf '  运行状态：%s\n' "$service_state_cn"
+    printf '  监听端口：%s\n' "${port:-未知}"
+    printf '  登录等待时间：%s 秒\n' "${login_grace:-未知}"
+    printf '  最大认证尝试：%s 次\n' "${max_auth:-未知}"
+    printf '\nSSH 认证安全\n'
+    printf '  Root 登录策略：%s\n' "$root_text"
+    printf '  公钥认证：%s\n' "$pubkey_text"
+    printf '  密码认证：%s\n' "$password_text"
+    printf '  键盘交互认证：%s\n' "$kbd_text"
+    printf '  强制认证方式：%s\n' "$auth_text"
+    printf '\n安全判断：%s\n' "$summary"
   else
     printf 'SSH 服务：未安装\n'
   fi
@@ -752,14 +862,14 @@ install_openssh_service() {
   ensure_openssh
   systemctl enable --now "$SSH_SERVICE"
   "$SSHD_BIN" -t
-  ok "OpenSSH Server 已安装并启动。"
+  ok "OpenSSH 服务已安装并启动。"
 }
 
 reload_ssh_service() {
   ensure_openssh
   "$SSHD_BIN" -t
   systemctl reload "$SSH_SERVICE"
-  ok "SSH 配置校验通过并已 reload。"
+  ok "SSH 配置校验通过并已重新加载。"
 }
 
 ssh_status_badge() {
@@ -898,10 +1008,10 @@ ssh_menu() {
     cat <<EOF
 SSH 与密钥管理 [$(ssh_status_badge)]
 
-1) 查看 SSH 状态与生效配置
-2) 安装/修复 OpenSSH Server
-3) 创建非 root 用户并安装公钥
-4) 加固 SSH 或修改端口
+1) 查看 SSH 状态与安全配置
+2) 安装/修复 OpenSSH 服务
+3) 为登录用户安装公钥（默认 root）
+4) 启用仅密钥登录或修改端口
 5) 校验并重新加载 SSH
 6) 恢复最近一次 SSH 配置备份
 0) 返回一级菜单
@@ -975,7 +1085,7 @@ fail2ban_menu() {
     cat <<EOF
 Fail2ban 管理 [$(fail2ban_status_badge)]
 
-1) 查看服务与 SSH jail 状态
+1) 查看服务与 SSH 防护规则状态
 2) 安装并启动 Fail2ban
 3) 配置/修改 SSH 防护参数
 4) 校验并重新加载配置

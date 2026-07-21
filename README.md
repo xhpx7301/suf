@@ -9,8 +9,8 @@ SUF 本身不是常驻服务。它只在执行命令时运行，适合资源有�
 ## 功能
 
 - 一级菜单按 SSH、UFW、Fail2ban 分类并显示运行状态
-- 创建非 root 运维用户并安装 Ed25519 公钥
-- 禁止 root、密码和键盘交互式 SSH 登录
+- 默认给 root 安装 Ed25519 公钥，也可选择普通 sudo 用户
+- 允许 root 仅通过密钥登录，禁止所有 SSH 密码和键盘交互认证
 - 修改 SSH 端口，应用前校验，失败自动恢复
 - 安装、配置、启用、关闭和卸载 UFW
 - 放行端口、限制来源 IP/CIDR、连接限速和删除规则
@@ -23,21 +23,33 @@ SUF 本身不是常驻服务。它只在执行命令时运行，适合资源有�
 
 - Debian 12/13
 - Ubuntu 22.04/24.04 及相近版本
-- systemd + OpenSSH Server
+- systemd + OpenSSH 服务
 
 脚本不会修改云厂商安全组。修改 SSH 端口前，必须先在云控制台放行新端口。
 
 ## 快捷安装
 
-一条命令完成克隆、安装并打开 SUF 菜单：
+首次安装和后续更新都使用同一条命令：
 
 ```bash
-git clone --depth 1 https://github.com/xhpx7301/suf.git && sudo bash suf/install.sh
+SUF_SETUP="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/xhpx7301/suf/main/setup.sh -o "$SUF_SETUP" && bash "$SUF_SETUP"
 ```
+
+命令行为：
+
+- `$HOME/suf` 不存在：自动克隆仓库后安装。
+- `$HOME/suf` 已是正确仓库：自动执行 `git pull --ff-only` 后更新安装。
+- 目录不是 SUF 仓库或存在未提交修改：停止操作，不覆盖任何文件。
 
 安装完成后会自动进入菜单。以后随时执行 `suf` 即可重新打开。
 
-如果当前目录已经存在 `suf` 文件夹，请进入该目录执行更新流程，不要重复克隆。
+不立即打开菜单：
+
+```bash
+SUF_SETUP="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/xhpx7301/suf/main/setup.sh -o "$SUF_SETUP" && bash "$SUF_SETUP" --no-launch
+```
+
+快捷命令先用 `mktemp` 创建唯一临时文件，再下载并执行脚本，没有使用远程内容直接管道到 root shell。
 
 ## 审查后安装
 
@@ -87,7 +99,7 @@ suf --help          # 查看帮助
 ## 菜单结构
 
 ```text
-SUF 1.0.0 - Server UFW & SSH Fortress
+SUF 1.1.0 - Server UFW & SSH Fortress
 
 1) SSH 与密钥管理
 2) UFW 防火墙管理
@@ -109,13 +121,13 @@ ssh-keygen -t ed25519 -a 100
 
 给私钥设置强口令。`id_ed25519` 是私钥，不能上传服务器、GitHub 或聊天工具；SUF 需要的是 `id_ed25519.pub` 内容。
 
-1. 进入 SSH 菜单，创建非 root 用户并粘贴公钥。
-2. 保持原 SSH 会话，在第二个终端测试密钥登录和 `sudo -v`。
+1. 进入 SSH 菜单，为默认的 root 用户粘贴 Ed25519 公钥。
+2. 保持原 SSH 会话，在第二个终端测试 `ssh root@服务器IP`，并确认 `whoami` 输出 `root`。
 3. 进入 UFW 菜单，安装并执行引导式初始配置。
 4. 确认云安全组已放行目标 SSH 端口。
-5. 返回 SSH 菜单，关闭 root 和密码登录或修改端口。
+5. 返回 SSH 菜单，启用 root 仅密钥登录、禁止所有密码认证，并可修改端口。
 6. 保持原会话，在第三个终端测试新端口。
-7. 进入 Fail2ban 菜单，安装并配置 SSH jail。
+7. 进入 Fail2ban 菜单，安装并配置 SSH 防护规则。
 8. 新连接确认正常后，删除不需要的旧 UFW SSH 规则。
 
 ## 更新
@@ -154,6 +166,8 @@ sudo bash ./uninstall.sh
 - UFW 无法替代云安全组，两层都要正确配置。
 - Docker 发布端口可能绕过部分 UFW 入站路径，需要单独审核 Docker/iptables 规则。
 - “仅允许指定 IP”会检查并要求删除同端口的广泛 `allow` 或 `limit` 规则。
+- 默认 root 密钥直登能减少权限操作障碍，但私钥泄露会直接导致最高权限失陷，必须设置私钥口令并妥善备份。
+- SUF 使用 `PermitRootLogin prohibit-password`，不会使用允许 root 密码登录的 `PermitRootLogin yes`。
 - 关闭或卸载 UFW、停止 Fail2ban 都需要输入完整确认词。
 - UFW 和 Fail2ban 使用 `apt-get remove` 卸载，保留配置且不会自动执行 `autoremove`。
 - 定期安装系统安全更新、检查日志并验证异地备份。
