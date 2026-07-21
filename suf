@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.1.3"
+APP_VERSION="1.1.4"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 SSH_MAIN="/etc/ssh/sshd_config"
 SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSH_DROPIN="${SSH_DROPIN_DIR}/00-suf-hardening.conf"
 BACKUP_ROOT="/var/backups/${APP_NAME}"
+FAIL2BAN_JAIL_DIR="/etc/fail2ban/jail.d"
+FAIL2BAN_JAIL_FILE="${FAIL2BAN_JAIL_DIR}/${APP_NAME}.local"
 LAST_CONFIGURED_USER=""
 export LC_ALL=C
 
@@ -791,7 +793,7 @@ uninstall_ufw_service() {
 
 configure_fail2ban() {
   local default_port ssh_port maxretry findtime bantime
-  local jail_file=/etc/fail2ban/jail.d/suf.local
+  local jail_file=$FAIL2BAN_JAIL_FILE
   local backup_file=""
   apt_install fail2ban python3-systemd
   ensure_openssh
@@ -862,6 +864,11 @@ ensure_fail2ban_running() {
 
 install_fail2ban_service() {
   apt_install fail2ban python3-systemd
+  ensure_fail2ban_systemd_backend
+  if ! fail2ban-client -t; then
+    show_fail2ban_start_diagnostics
+    die "Fail2ban 配置校验失败，服务尚未启动；请先修复上面的配置错误。"
+  fi
   systemctl enable fail2ban
   systemctl reset-failed fail2ban || true
   if ! systemctl start fail2ban; then
@@ -870,6 +877,24 @@ install_fail2ban_service() {
   fi
   ensure_fail2ban_running
   ok "Fail2ban 已安装并启动。下一步请配置 SSH 防护规则。"
+}
+
+ensure_fail2ban_systemd_backend() {
+  mkdir -p "$FAIL2BAN_JAIL_DIR"
+
+  # Debian may enable the sshd jail by default while still expecting
+  # /var/log/auth.log. Override only the backend so journald-only systems work.
+  if [[ -e $FAIL2BAN_JAIL_FILE ]]; then
+    return
+  fi
+
+  cat >"$FAIL2BAN_JAIL_FILE" <<'EOF'
+# Managed by SUF: use journald when /var/log/auth.log is unavailable.
+[sshd]
+backend = systemd
+EOF
+  chmod 600 "$FAIL2BAN_JAIL_FILE"
+  chown root:root "$FAIL2BAN_JAIL_FILE"
 }
 
 fail2ban_status_value() {
@@ -1167,7 +1192,7 @@ all_in_one() {
 
   write_sshd_hardening "$target_port" "$target_user"
 
-  cat >/etc/fail2ban/jail.d/suf.local <<EOF
+  cat >"$FAIL2BAN_JAIL_FILE" <<EOF
 [sshd]
 enabled = true
 port = ${target_port}
@@ -1178,7 +1203,7 @@ bantime = 1h
 bantime.increment = true
 bantime.factor = 2
 EOF
-  chmod 600 /etc/fail2ban/jail.d/suf.local
+  chmod 600 "$FAIL2BAN_JAIL_FILE"
   fail2ban-client -t
   systemctl enable --now fail2ban
   systemctl restart fail2ban

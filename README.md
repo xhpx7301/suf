@@ -99,7 +99,7 @@ suf --help          # 查看帮助
 ## 菜单结构
 
 ```text
-SUF 1.1.3 - Server UFW & SSH Fortress
+SUF 1.1.4 - Server UFW & SSH Fortress
 
 1) SSH 与密钥管理
 2) UFW 防火墙管理
@@ -156,7 +156,7 @@ SUF 1.1.3 - Server UFW & SSH Fortress
 | 选项 | 作用与注意事项 |
 | --- | --- |
 | `1` 查看服务与 SSH 防护规则状态 | 显示 Fail2ban 是否运行、`sshd` jail 和当前封禁情况。 |
-| `2` 安装并启动 Fail2ban | 同时安装 `python3-systemd`，适配 Debian/Ubuntu 无 `/var/log/auth.log` 的精简系统。安装后还需使用选项 `3` 创建 SSH 防护规则。 |
+| `2` 安装并启动 Fail2ban | 同时安装 `python3-systemd`，并自动为 SSH jail 使用 systemd 日志后端，适配 Debian/Ubuntu 无 `/var/log/auth.log` 的精简系统。安装后还可使用选项 `3` 调整 SSH 防护参数。 |
 | `3` 配置/修改 SSH 防护参数 | 使用 systemd 日志监控 SSH，可设置监听端口、最大失败次数、统计窗口和首次封禁时间。 |
 | `4` 校验并重新加载配置 | 校验 Fail2ban 配置后重载；修改参数后使用。 |
 | `5` 解封指定 IP | 将误封的 IP 从 `sshd` jail 中移除。 |
