@@ -1,2 +1,5 @@
-# Auto detect text files and perform LF normalization
+# Normalize repository text and keep Linux scripts on LF line endings.
 * text=auto
+.gitattributes text eol=lf
+*.sh text eol=lf
+suf text eol=lf

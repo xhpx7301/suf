@@ -1,0 +1,1072 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_VERSION="1.0.0"
+APP_NAME="suf"
+APP_REPOSITORY="https://github.com/xhpx7301/suf"
+SSH_MAIN="/etc/ssh/sshd_config"
+SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
+SSH_DROPIN="${SSH_DROPIN_DIR}/00-suf-hardening.conf"
+BACKUP_ROOT="/var/backups/${APP_NAME}"
+LAST_CONFIGURED_USER=""
+export LC_ALL=C
+
+if [[ -t 1 ]]; then
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_RESET=$'\033[0m'
+else
+  C_RED=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_BLUE=""
+  C_RESET=""
+fi
+
+info() { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+ok() { printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+die() { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+pause() {
+  printf '\n'
+  read -r -p "按 Enter 返回菜单..." _
+}
+
+confirm() {
+  local prompt=$1 answer
+  read -r -p "${prompt} [y/N] " answer
+  [[ ${answer:-n} =~ ^[Yy]$ ]]
+}
+
+require_root() {
+  if [[ $EUID -eq 0 ]]; then
+    return
+  fi
+  command -v sudo >/dev/null 2>&1 || die "需要 root 权限，但系统未安装 sudo。"
+  [[ -t 0 ]] || die "非交互环境请使用 sudo suf。"
+  exec sudo -- "$0" "$@"
+}
+
+load_os() {
+  [[ -r /etc/os-release ]] || die "无法识别操作系统。"
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  case "${ID:-}" in
+    debian|ubuntu) ;;
+    *) die "当前仅支持 Debian/Ubuntu；检测到：${ID:-unknown}。" ;;
+  esac
+  command -v apt-get >/dev/null 2>&1 || die "未找到 apt-get。"
+  command -v systemctl >/dev/null 2>&1 || die "当前系统未使用 systemd。"
+}
+
+apt_install() {
+  local missing=() package
+  for package in "$@"; do
+    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing+=("$package")
+  done
+
+  if ((${#missing[@]} == 0)); then
+    return
+  fi
+
+  info "安装软件包：${missing[*]}"
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+}
+
+find_sshd_bin() {
+  if command -v sshd >/dev/null 2>&1; then
+    command -v sshd
+  elif [[ -x /usr/sbin/sshd ]]; then
+    printf '%s\n' /usr/sbin/sshd
+  else
+    return 1
+  fi
+}
+
+find_ssh_service() {
+  if systemctl list-unit-files ssh.service --no-legend 2>/dev/null | grep -q '^ssh\.service'; then
+    printf '%s\n' ssh
+  elif systemctl list-unit-files sshd.service --no-legend 2>/dev/null | grep -q '^sshd\.service'; then
+    printf '%s\n' sshd
+  else
+    return 1
+  fi
+}
+
+ensure_openssh() {
+  apt_install openssh-server openssh-client
+  SSHD_BIN=$(find_sshd_bin) || die "未找到 sshd。"
+  SSH_SERVICE=$(find_ssh_service) || die "未找到 SSH systemd 服务。"
+}
+
+effective_sshd_value() {
+  local key=$1
+  "$SSHD_BIN" -T 2>/dev/null | awk -v wanted="$key" '$1 == wanted { print $2; exit }'
+}
+
+current_ssh_port() {
+  local port
+  port=$(effective_sshd_value port || true)
+  printf '%s\n' "${port:-22}"
+}
+
+valid_port() {
+  [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+prompt_port() {
+  local default_port=$1 entered
+  while true; do
+    read -r -p "SSH 端口 [${default_port}]：" entered
+    entered=${entered:-$default_port}
+    if valid_port "$entered"; then
+      printf '%s\n' "$((10#$entered))"
+      return
+    fi
+    warn "端口必须是 1 到 65535 的整数。"
+  done
+}
+
+prompt_protocol() {
+  local protocol
+  while true; do
+    read -r -p "协议 tcp/udp [tcp]：" protocol
+    protocol=${protocol:-tcp}
+    case "$protocol" in
+      tcp|udp) printf '%s\n' "$protocol"; return ;;
+      *) warn "协议只能是 tcp 或 udp。" ;;
+    esac
+  done
+}
+
+prompt_positive_integer() {
+  local prompt=$1 default_value=$2 value
+  while true; do
+    read -r -p "${prompt} [${default_value}]：" value
+    value=${value:-$default_value}
+    if [[ $value =~ ^[0-9]+$ ]] && ((10#$value > 0)); then
+      printf '%s\n' "$((10#$value))"
+      return
+    fi
+    warn "请输入大于 0 的整数。"
+  done
+}
+
+prompt_duration() {
+  local prompt=$1 default_value=$2 value
+  while true; do
+    read -r -p "${prompt} [${default_value}]：" value
+    value=${value:-$default_value}
+    if [[ $value =~ ^([0-9]+)([smhdw]?)$ ]] && ((10#${BASH_REMATCH[1]} > 0)); then
+      printf '%s\n' "$value"
+      return
+    fi
+    warn "时间格式无效，可使用 600、10m、1h、1d 或 1w。"
+  done
+}
+
+user_home() {
+  getent passwd "$1" | cut -d: -f6
+}
+
+user_has_sudo() {
+  id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|wheel'
+}
+
+ensure_admin_user() {
+  local target_user=$1
+
+  [[ $target_user =~ ^[a-z_][a-z0-9_-]*$ ]] || die "用户名格式无效。"
+  [[ $target_user != root ]] || die "运维账号不能是 root。"
+
+  if ! id "$target_user" >/dev/null 2>&1; then
+    info "创建运维账号 ${target_user}。请为 sudo 设置一个强本地密码。"
+    adduser "$target_user"
+  fi
+
+  if ! user_has_sudo "$target_user"; then
+    usermod -aG sudo "$target_user"
+    ok "已把 ${target_user} 加入 sudo 组。"
+  fi
+}
+
+validate_public_key() {
+  local key=$1 tmp
+  [[ $key != *$'\n'* ]] || return 1
+  [[ $key =~ ^(ssh-ed25519|sk-ssh-ed25519@openssh.com)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]] || return 1
+  tmp=$(mktemp)
+  printf '%s\n' "$key" >"$tmp"
+  if ! ssh-keygen -lf "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+install_public_key() {
+  local target_user home ssh_dir auth_file public_key key_type key_body fingerprint
+
+  read -r -p "目标运维用户名 [ops]：" target_user
+  target_user=${target_user:-ops}
+  ensure_admin_user "$target_user"
+
+  home=$(user_home "$target_user")
+  [[ -n $home && -d $home ]] || die "找不到 ${target_user} 的家目录。"
+
+  printf '\n请在自己的电脑生成密钥（私钥不要上传服务器或 GitHub）：\n'
+  printf '  ssh-keygen -t ed25519 -a 100\n\n'
+  read -r -p "粘贴 id_ed25519.pub 的完整单行内容：" public_key
+  validate_public_key "$public_key" || die "公钥无效；仅接受 Ed25519 公钥。"
+
+  ssh_dir="${home}/.ssh"
+  auth_file="${ssh_dir}/authorized_keys"
+  install -d -m 700 -o "$target_user" -g "$target_user" "$ssh_dir"
+  touch "$auth_file"
+  chown "$target_user:$target_user" "$auth_file"
+  chmod 600 "$auth_file"
+
+  read -r key_type key_body _ <<<"$public_key"
+  if awk -v type="$key_type" -v body="$key_body" '
+    {
+      for (i = 1; i < NF; i++) {
+        if ($i == type && $(i + 1) == body) {
+          found = 1
+        }
+      }
+    }
+    END { exit !found }
+  ' "$auth_file"; then
+    warn "该公钥已存在，未重复写入。"
+  else
+    printf '%s\n' "$public_key" >>"$auth_file"
+    ok "公钥已写入 ${auth_file}。"
+  fi
+
+  fingerprint=$(printf '%s\n' "$public_key" | ssh-keygen -lf - | awk '{print $2}')
+  LAST_CONFIGURED_USER=$target_user
+  printf '账号：%s\n指纹：%s\n' "$target_user" "$fingerprint"
+  printf '\n请保持当前 SSH 会话不关闭，并在第二个终端测试：\n'
+  printf '  ssh -p %s %s@服务器IP\n' "$(current_ssh_port)" "$target_user"
+  printf '登录后还要执行：sudo -v\n'
+}
+
+backup_ssh_config() {
+  local stamp backup_dir
+  stamp=$(date +%Y%m%d-%H%M%S)
+  backup_dir="${BACKUP_ROOT}/${stamp}"
+  mkdir -p "$backup_dir"
+  cp -a "$SSH_MAIN" "${backup_dir}/sshd_config"
+  if [[ -e $SSH_DROPIN ]]; then
+    cp -a "$SSH_DROPIN" "${backup_dir}/00-suf-hardening.conf"
+  else
+    : >"${backup_dir}/dropin-was-absent"
+  fi
+  printf '%s\n' "$backup_dir"
+}
+
+restore_ssh_backup() {
+  local backup_dir=$1
+  cp -a "${backup_dir}/sshd_config" "$SSH_MAIN"
+  if [[ -e ${backup_dir}/dropin-was-absent ]]; then
+    rm -f "$SSH_DROPIN"
+  else
+    cp -a "${backup_dir}/00-suf-hardening.conf" "$SSH_DROPIN"
+  fi
+}
+
+ensure_dropin_include_first() {
+  local tmp
+  if head -n 4 "$SSH_MAIN" | grep -q '^# BEGIN SUF managed include$'; then
+    return
+  fi
+
+  tmp=$(mktemp)
+  {
+    printf '%s\n' '# BEGIN SUF managed include'
+    printf '%s\n' "Include ${SSH_DROPIN}"
+    printf '%s\n' '# END SUF managed include'
+    cat "$SSH_MAIN"
+  } >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$SSH_MAIN"
+  rm -f "$tmp"
+}
+
+authorized_key_count() {
+  local target_user=$1 home auth_file
+  home=$(user_home "$target_user")
+  auth_file="${home}/.ssh/authorized_keys"
+  [[ -r $auth_file ]] || { printf '0\n'; return; }
+  awk '$1 ~ /^(ssh-ed25519|sk-ssh-ed25519@openssh.com)$/ && $2 != "" { count++ } END { print count+0 }' "$auth_file"
+}
+
+require_tested_key_login() {
+  local target_user=$1 confirmation count
+  [[ $target_user != root ]] || die "必须使用非 root 运维账号。"
+  id "$target_user" >/dev/null 2>&1 || die "账号 ${target_user} 不存在。"
+  user_has_sudo "$target_user" || die "账号 ${target_user} 没有 sudo 权限。"
+  count=$(authorized_key_count "$target_user")
+  ((count > 0)) || die "账号 ${target_user} 没有有效的 Ed25519 authorized_keys。"
+
+  warn "只有在第二个终端已用 ${target_user} 的密钥登录并成功执行 sudo -v 后才能继续。"
+  read -r -p "确认已完成测试请输入 TESTED：" confirmation
+  [[ $confirmation == TESTED ]] || die "未确认测试，取消 SSH 加固。"
+}
+
+write_sshd_hardening() {
+  local port=$1 target_user=$2 backup_dir effective
+  backup_dir=$(backup_ssh_config)
+  mkdir -p "$SSH_DROPIN_DIR"
+
+  ensure_dropin_include_first
+  cat >"$SSH_DROPIN" <<EOF
+# Managed by SUF ${APP_VERSION}
+Port ${port}
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitEmptyPasswords no
+AuthenticationMethods publickey
+PermitRootLogin no
+MaxAuthTries 3
+LoginGraceTime 30
+EOF
+  chmod 600 "$SSH_DROPIN"
+  chown root:root "$SSH_DROPIN"
+
+  if ! "$SSHD_BIN" -t; then
+    warn "sshd 配置校验失败，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "旧配置恢复后仍无法通过校验，请保持当前会话并人工检查 ${SSH_MAIN}。"
+    die "没有应用任何 SSH 变更。"
+  fi
+
+  effective=$("$SSHD_BIN" -T -C "user=root,host=$(hostname),addr=127.0.0.1")
+  for expected in \
+    "port ${port}" \
+    "pubkeyauthentication yes" \
+    "passwordauthentication no" \
+    "kbdinteractiveauthentication no" \
+    "authenticationmethods publickey" \
+    "permitrootlogin no"; do
+    if ! grep -qx "$expected" <<<"$effective"; then
+      warn "最终 SSH 配置未生效：${expected}，正在自动恢复。"
+      restore_ssh_backup "$backup_dir"
+      "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
+      die "没有应用任何 SSH 变更。"
+    fi
+  done
+
+  if ! systemctl reload "$SSH_SERVICE"; then
+    warn "SSH reload 失败，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t && systemctl reload "$SSH_SERVICE" || die "自动恢复失败；不要关闭当前 SSH 会话。"
+    die "SSH 变更已撤销。"
+  fi
+
+  ok "SSH 已加固，备份位于 ${backup_dir}。"
+  printf '\n不要关闭当前会话。请立即在第三个终端测试：\n'
+  printf '  ssh -p %s %s@服务器IP\n' "$port" "$target_user"
+}
+
+configure_ssh_hardening() {
+  local current_port target_port target_user
+  ensure_openssh
+  current_port=$(current_ssh_port)
+  read -r -p "已验证密钥登录的非 root 用户名 [ops]：" target_user
+  target_user=${target_user:-ops}
+  require_tested_key_login "$target_user"
+  target_port=$(prompt_port "$current_port")
+
+  warn "请先确认云厂商安全组已放行 TCP/${target_port}。"
+  confirm "已经放行或服务器没有外部安全组吗？" || die "取消操作。"
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${target_port}/tcp" comment 'SSH managed by SUF' >/dev/null
+    ok "UFW 已放行 TCP/${target_port}。"
+  else
+    warn "尚未安装 UFW。建议先从菜单安装 UFW，再修改 SSH。"
+    confirm "仍要继续吗？" || die "取消操作。"
+  fi
+
+  write_sshd_hardening "$target_port" "$target_user"
+}
+
+allow_extra_ufw_ports() {
+  local input entry port proto
+  printf '\n额外端口格式示例：8443/tcp,51820/udp。留空表示不添加。\n'
+  read -r -p "需要额外放行的端口：" input
+  [[ -n $input ]] || return
+
+  IFS=',' read -r -a entries <<<"$input"
+  for entry in "${entries[@]}"; do
+    entry=${entry//[[:space:]]/}
+    if [[ $entry =~ ^([0-9]+)/(tcp|udp)$ ]]; then
+      port=${BASH_REMATCH[1]}
+      proto=${BASH_REMATCH[2]}
+      if valid_port "$port"; then
+        ufw allow "$((10#$port))/${proto}" comment 'Additional service'
+        continue
+      fi
+    fi
+    die "无效端口规则：${entry}。应使用 端口/tcp 或 端口/udp。"
+  done
+}
+
+configure_ufw() {
+  local current_port ssh_port
+  apt_install ufw
+  ensure_openssh
+  current_port=$(current_ssh_port)
+  ssh_port=$(prompt_port "$current_port")
+
+  warn "请确保云安全组同时放行 TCP/${ssh_port}。"
+  confirm "确认继续配置 UFW 吗？" || die "取消操作。"
+
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow "${ssh_port}/tcp" comment 'SSH managed by SUF'
+  if [[ $current_port != "$ssh_port" ]]; then
+    ufw allow "${current_port}/tcp" comment 'Current SSH temporary'
+  fi
+
+  if confirm "这台服务器需要对公网提供 HTTP/HTTPS 吗？"; then
+    ufw allow 80/tcp comment 'HTTP'
+    ufw allow 443/tcp comment 'HTTPS'
+  fi
+  allow_extra_ufw_ports
+
+  warn "启用后，未明确放行的入站端口将被阻止。"
+  ufw show added || true
+  confirm "确认以上规则完整，可以启用 UFW 吗？" || die "UFW 尚未启用。"
+  ufw --force enable
+  ok "UFW 已启用。当前和目标 SSH 端口均已放行，旧规则不会被脚本自动删除。"
+  ufw status verbose
+}
+
+require_ufw() {
+  command -v ufw >/dev/null 2>&1 || die "UFW 尚未安装，请先选择安装。"
+}
+
+install_ufw_service() {
+  apt_install ufw
+  ok "UFW 已安装。安装不会自动启用防火墙。"
+}
+
+show_ufw_status() {
+  if command -v ufw >/dev/null 2>&1; then
+    ufw status verbose
+  else
+    printf 'UFW：未安装\n'
+  fi
+}
+
+show_ufw_rules() {
+  require_ufw
+  ufw status numbered
+  printf '\n脚本添加形式：\n'
+  ufw show added || true
+}
+
+show_listening_ports() {
+  printf '以下是实际监听端口，不代表已被 UFW 放行：\n\n'
+  if command -v ss >/dev/null 2>&1; then
+    ss -lntup
+  else
+    die "未找到 ss，请安装 iproute2。"
+  fi
+}
+
+ufw_allow_port() {
+  local port protocol
+  require_ufw
+  port=$(prompt_port 443)
+  protocol=$(prompt_protocol)
+  ufw allow "${port}/${protocol}" comment 'Managed service'
+  ok "已放行 ${port}/${protocol}。"
+}
+
+remove_broad_ufw_allows() {
+  local port=$1 protocol=$2 action rule_spec attempts
+  local -a broad_actions=(allow limit)
+  local -a broad_specs=("${port}/${protocol}" "${port}")
+
+  if ! ufw show added | grep -Eq "^ufw (allow|limit) (${port}/${protocol}|${port})([[:space:]]|$)"; then
+    return
+  fi
+
+  warn "检测到 ${port}/${protocol} 仍有对所有来源开放的规则。"
+  ufw show added || true
+  confirm "删除这些广泛放行规则，使 IP 限制真正生效吗？" || die "已保留广泛规则，因此不能称为仅允许指定 IP。"
+
+  for action in "${broad_actions[@]}"; do
+    for rule_spec in "${broad_specs[@]}"; do
+      attempts=0
+      while ufw show added | grep -Eq "^ufw ${action} ${rule_spec}([[:space:]]|$)"; do
+        ((attempts += 1))
+        ((attempts <= 20)) || die "广泛放行规则过多，请通过编号规则菜单人工处理。"
+        ufw --force delete "$action" "$rule_spec"
+      done
+    done
+  done
+
+  if ufw show added | grep -Eq "^ufw (allow|limit) (${port}/${protocol}|${port})([[:space:]]|$)"; then
+    die "仍检测到广泛放行规则，请通过编号规则菜单人工删除。"
+  fi
+}
+
+ufw_allow_source_to_port() {
+  local source port protocol
+  require_ufw
+  read -r -p "允许的来源 IP 或 CIDR：" source
+  [[ $source =~ ^[0-9A-Fa-f:./]+$ ]] || die "IP/CIDR 包含无效字符。"
+  port=$(prompt_port 22)
+  protocol=$(prompt_protocol)
+
+  # UFW performs the final IPv4/IPv6 and CIDR validation.
+  ufw allow from "$source" to any port "$port" proto "$protocol" comment 'Restricted source'
+  remove_broad_ufw_allows "$port" "$protocol"
+  ok "已限制为 ${source} 可访问 ${port}/${protocol}。"
+}
+
+ufw_limit_port() {
+  local port
+  require_ufw
+  port=$(prompt_port 22)
+  ufw limit "${port}/tcp" comment 'Rate limited service'
+  ok "已为 ${port}/tcp 添加连接限速规则。UFW limit 仅用于 TCP 连接。"
+}
+
+ufw_delete_numbered_rule() {
+  local number
+  require_ufw
+  ufw status numbered
+  read -r -p "要删除的规则编号：" number
+  [[ $number =~ ^[0-9]+$ ]] && ((10#$number > 0)) || die "规则编号无效。"
+  warn "删除后其他规则编号会变化。"
+  confirm "确认删除规则 ${number} 吗？" || die "取消删除。"
+  ufw --force delete "$((10#$number))"
+  ufw status numbered
+}
+
+ufw_is_active() {
+  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active$'
+}
+
+enable_ufw_service() {
+  local ssh_port source_ip confirmation
+  require_ufw
+  if ufw_is_active; then
+    ok "UFW 已经处于启用状态。"
+    return
+  fi
+
+  ensure_openssh
+  ssh_port=$(current_ssh_port)
+  source_ip=${SSH_CONNECTION:-}
+  source_ip=${source_ip%% *}
+
+  if [[ -n ${SSH_CONNECTION:-} && $source_ip =~ ^[0-9A-Fa-f:.]+$ ]]; then
+    info "为当前 SSH 来源 ${source_ip} 保留 TCP/${ssh_port} 访问权限。"
+    ufw insert 1 allow from "$source_ip" to any port "$ssh_port" proto tcp comment 'Current SSH client'
+  else
+    warn "未检测到当前 SSH 来源，将放行所有来源访问 TCP/${ssh_port}。"
+    confirm "确认按此方式保护当前管理入口吗？" || die "取消启用。"
+    ufw insert 1 allow "${ssh_port}/tcp" comment 'SSH management'
+  fi
+
+  warn "UFW 启用后，未明确放行的入站端口将被阻止。"
+  warn "云安全组不受 UFW 控制；Docker 发布端口也需要单独审核。"
+  ufw show added || true
+  read -r -p "确认规则完整请输入 ENABLE-UFW：" confirmation
+  [[ $confirmation == ENABLE-UFW ]] || die "未启用 UFW。"
+  ufw --force enable
+  ufw status verbose
+}
+
+reload_ufw_service() {
+  require_ufw
+  ufw reload
+  ok "UFW 规则已重新加载。"
+}
+
+disable_ufw_service() {
+  local confirmation
+  require_ufw
+  warn "关闭 UFW 会让监听端口失去这层防火墙保护。"
+  show_listening_ports
+  read -r -p "确认关闭请输入 DISABLE-UFW：" confirmation
+  [[ $confirmation == DISABLE-UFW ]] || die "取消关闭。"
+  ufw --force disable
+  ok "UFW 已关闭。"
+}
+
+uninstall_ufw_service() {
+  local confirmation
+  require_ufw
+  warn "将关闭 UFW 并移除软件包，但保留 /etc/ufw 配置文件。"
+  read -r -p "确认卸载请输入 UNINSTALL-UFW：" confirmation
+  [[ $confirmation == UNINSTALL-UFW ]] || die "取消卸载。"
+  ufw --force disable || true
+  DEBIAN_FRONTEND=noninteractive apt-get remove -y ufw
+  ok "UFW 软件包已移除，配置文件仍保留。"
+}
+
+configure_fail2ban() {
+  local default_port ssh_port maxretry findtime bantime
+  local jail_file=/etc/fail2ban/jail.d/suf.local
+  local backup_file=""
+  apt_install fail2ban
+  ensure_openssh
+  default_port=$(current_ssh_port)
+  ssh_port=$(prompt_port "$default_port")
+  maxretry=$(prompt_positive_integer "最大失败次数" 5)
+  findtime=$(prompt_duration "统计时间窗口" 10m)
+  bantime=$(prompt_duration "首次封禁时间" 1h)
+
+  if [[ -e $jail_file ]]; then
+    mkdir -p "${BACKUP_ROOT}/fail2ban"
+    backup_file="${BACKUP_ROOT}/fail2ban/suf.$(date +%Y%m%d-%H%M%S).local"
+    cp -a "$jail_file" "$backup_file"
+  fi
+
+  cat >"$jail_file" <<EOF
+[sshd]
+enabled = true
+port = ${ssh_port}
+backend = systemd
+maxretry = ${maxretry}
+findtime = ${findtime}
+bantime = ${bantime}
+bantime.increment = true
+bantime.factor = 2
+EOF
+  chmod 600 "$jail_file"
+  chown root:root "$jail_file"
+
+  if ! fail2ban-client -t; then
+    if [[ -n $backup_file ]]; then
+      cp -a "$backup_file" "$jail_file"
+    else
+      rm -f "$jail_file"
+    fi
+    die "Fail2ban 配置校验失败，已恢复原配置。"
+  fi
+  systemctl enable --now fail2ban
+  systemctl restart fail2ban
+  ok "Fail2ban SSH 防护已启用。"
+  fail2ban-client status sshd || true
+}
+
+require_fail2ban() {
+  command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装，请先选择安装。"
+}
+
+install_fail2ban_service() {
+  apt_install fail2ban
+  systemctl enable --now fail2ban
+  ok "Fail2ban 已安装并启动。下一步请配置 SSH jail。"
+}
+
+show_fail2ban_status() {
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    printf '服务状态：%s\n' "$(systemctl is-active fail2ban 2>/dev/null || true)"
+    fail2ban-client status || true
+    printf '\nSSH jail：\n'
+    fail2ban-client status sshd 2>/dev/null || printf '  sshd jail 尚未启用。\n'
+  else
+    printf 'Fail2ban：未安装\n'
+  fi
+}
+
+reload_fail2ban_service() {
+  require_fail2ban
+  fail2ban-client -t
+  if systemctl is-active --quiet fail2ban; then
+    fail2ban-client reload
+  else
+    systemctl enable --now fail2ban
+  fi
+  ok "Fail2ban 配置已重新加载。"
+}
+
+unban_fail2ban_ip() {
+  local address
+  require_fail2ban
+  read -r -p "要解封的 IPv4/IPv6 地址：" address
+  [[ $address =~ ^[0-9A-Fa-f:.]+$ ]] || die "IP 地址格式无效。"
+  fail2ban-client set sshd unbanip "$address"
+  ok "已提交解封：${address}。"
+}
+
+stop_fail2ban_service() {
+  local confirmation
+  require_fail2ban
+  warn "停止 Fail2ban 后将不再自动封禁新的攻击来源。"
+  read -r -p "确认停止请输入 STOP-FAIL2BAN：" confirmation
+  [[ $confirmation == STOP-FAIL2BAN ]] || die "取消停止。"
+  systemctl disable --now fail2ban
+  ok "Fail2ban 已停止并取消开机启动。"
+}
+
+uninstall_fail2ban_service() {
+  local confirmation
+  require_fail2ban
+  warn "将停止 Fail2ban 并移除软件包，但保留 /etc/fail2ban 配置。"
+  read -r -p "确认卸载请输入 UNINSTALL-FAIL2BAN：" confirmation
+  [[ $confirmation == UNINSTALL-FAIL2BAN ]] || die "取消卸载。"
+  systemctl disable --now fail2ban || true
+  DEBIAN_FRONTEND=noninteractive apt-get remove -y fail2ban
+  ok "Fail2ban 软件包已移除，配置文件仍保留。"
+}
+
+restore_latest_ssh_backup() {
+  local backup_dir
+  ensure_openssh
+  [[ -d $BACKUP_ROOT ]] || die "没有找到 SSH 配置备份。"
+  backup_dir=$(find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type f -name sshd_config -printf '%h\n' 2>/dev/null | sort | tail -n 1)
+  [[ -n $backup_dir ]] || die "没有找到 SSH 配置备份。"
+  warn "将恢复最新备份：${backup_dir}"
+  confirm "确认恢复吗？" || die "取消操作。"
+  restore_ssh_backup "$backup_dir"
+  "$SSHD_BIN" -t || die "备份配置校验失败，未 reload SSH。"
+  systemctl reload "$SSH_SERVICE"
+  ok "已恢复 ${backup_dir}。请保持当前会话并测试新连接。"
+}
+
+show_ssh_status() {
+  local sshd_bin ssh_service
+  if sshd_bin=$(find_sshd_bin 2>/dev/null) && ssh_service=$(find_ssh_service 2>/dev/null); then
+    printf 'SSH 服务：%s (%s)\n' "$ssh_service" "$(systemctl is-active "$ssh_service" 2>/dev/null || true)"
+    "$sshd_bin" -T 2>/dev/null | awk '$1 ~ /^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|permitrootlogin|maxauthtries|logingracetime)$/ {print "  "$0}'
+  else
+    printf 'SSH 服务：未安装\n'
+  fi
+}
+
+install_openssh_service() {
+  ensure_openssh
+  systemctl enable --now "$SSH_SERVICE"
+  "$SSHD_BIN" -t
+  ok "OpenSSH Server 已安装并启动。"
+}
+
+reload_ssh_service() {
+  ensure_openssh
+  "$SSHD_BIN" -t
+  systemctl reload "$SSH_SERVICE"
+  ok "SSH 配置校验通过并已 reload。"
+}
+
+ssh_status_badge() {
+  local service
+  if service=$(find_ssh_service 2>/dev/null); then
+    if systemctl is-active --quiet "$service"; then
+      printf '运行中'
+    else
+      printf '已停止'
+    fi
+  else
+    printf '未安装'
+  fi
+}
+
+ufw_status_badge() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    printf '未安装'
+  elif ufw_is_active; then
+    printf '运行中'
+  else
+    printf '已关闭'
+  fi
+}
+
+fail2ban_status_badge() {
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    printf '未安装'
+  elif systemctl is-active --quiet fail2ban; then
+    printf '运行中'
+  else
+    printf '已停止'
+  fi
+}
+
+show_status() {
+  printf '\n系统：'
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    printf '%s\n' "${PRETTY_NAME:-unknown}"
+  else
+    printf 'unknown\n'
+  fi
+
+  show_ssh_status
+
+  printf '\nUFW：\n'
+  if command -v ufw >/dev/null 2>&1; then
+    ufw status verbose || true
+  else
+    printf '  未安装\n'
+  fi
+
+  printf '\nFail2ban：\n'
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    systemctl is-active fail2ban || true
+    fail2ban-client status sshd 2>/dev/null || true
+  else
+    printf '  未安装\n'
+  fi
+}
+
+all_in_one() {
+  local target_user current_port target_port confirmation
+  ensure_openssh
+  install_public_key
+
+  target_user=$LAST_CONFIGURED_USER
+  require_tested_key_login "$target_user"
+
+  current_port=$(current_ssh_port)
+  target_port=$(prompt_port "$current_port")
+  warn "请先在云安全组放行 TCP/${target_port}，当前 SSH 会话不要关闭。"
+  read -r -p "完成后输入 FIREWALL-READY：" confirmation
+  [[ $confirmation == FIREWALL-READY ]] || die "未确认云防火墙，取消操作。"
+
+  apt_install ufw fail2ban
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow "${target_port}/tcp" comment 'SSH managed by SUF'
+  if [[ $current_port != "$target_port" ]]; then
+    ufw allow "${current_port}/tcp" comment 'Current SSH temporary'
+  fi
+  if confirm "需要开放 HTTP/HTTPS 端口吗？"; then
+    ufw allow 80/tcp comment 'HTTP'
+    ufw allow 443/tcp comment 'HTTPS'
+  fi
+  allow_extra_ufw_ports
+  warn "启用后，未明确放行的入站端口将被阻止。"
+  ufw show added || true
+  confirm "确认以上规则完整，可以启用 UFW 吗？" || die "取消操作。"
+  ufw --force enable
+
+  write_sshd_hardening "$target_port" "$target_user"
+
+  cat >/etc/fail2ban/jail.d/suf.local <<EOF
+[sshd]
+enabled = true
+port = ${target_port}
+backend = systemd
+maxretry = 5
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.factor = 2
+EOF
+  chmod 600 /etc/fail2ban/jail.d/suf.local
+  fail2ban-client -t
+  systemctl enable --now fail2ban
+  systemctl restart fail2ban
+
+  ok "一键加固完成。"
+  warn "不要关闭当前会话，先测试：ssh -p ${target_port} ${target_user}@服务器IP"
+  warn "确认新连接成功后，再手动删除 UFW 中不需要的旧 SSH 端口规则。"
+}
+
+run_menu_action() {
+  local status
+  set +e
+  (
+    set -Eeuo pipefail
+    "$@"
+  )
+  status=$?
+  set -e
+  if ((status != 0)); then
+    warn "操作未完成（退出码 ${status}）。请检查上方提示。"
+  fi
+  pause
+}
+
+ssh_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+SSH 与密钥管理 [$(ssh_status_badge)]
+
+1) 查看 SSH 状态与生效配置
+2) 安装/修复 OpenSSH Server
+3) 创建非 root 用户并安装公钥
+4) 加固 SSH 或修改端口
+5) 校验并重新加载 SSH
+6) 恢复最近一次 SSH 配置备份
+0) 返回一级菜单
+EOF
+    printf '\n'
+    read -r -p "请选择：" choice
+    case "${choice:-}" in
+      1) run_menu_action show_ssh_status ;;
+      2) run_menu_action install_openssh_service ;;
+      3) run_menu_action ensure_openssh_and_key ;;
+      4) run_menu_action configure_ssh_hardening ;;
+      5) run_menu_action reload_ssh_service ;;
+      6) run_menu_action restore_latest_ssh_backup ;;
+      0) return ;;
+      *) warn "无效选项。"; pause ;;
+    esac
+  done
+}
+
+ensure_openssh_and_key() {
+  ensure_openssh
+  install_public_key
+}
+
+ufw_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+UFW 防火墙管理 [$(ufw_status_badge)]
+
+1) 查看状态
+2) 查看编号规则
+3) 查看实际监听端口
+4) 安装 UFW
+5) 引导式初始配置
+6) 放行端口
+7) 仅允许指定 IP/CIDR 访问端口
+8) 为端口添加连接限速
+9) 删除编号规则
+10) 启用 UFW
+11) 重新加载规则
+12) 关闭 UFW（危险）
+13) 卸载 UFW（保留配置）
+0) 返回一级菜单
+EOF
+    printf '\n'
+    read -r -p "请选择：" choice
+    case "${choice:-}" in
+      1) run_menu_action show_ufw_status ;;
+      2) run_menu_action show_ufw_rules ;;
+      3) run_menu_action show_listening_ports ;;
+      4) run_menu_action install_ufw_service ;;
+      5) run_menu_action configure_ufw ;;
+      6) run_menu_action ufw_allow_port ;;
+      7) run_menu_action ufw_allow_source_to_port ;;
+      8) run_menu_action ufw_limit_port ;;
+      9) run_menu_action ufw_delete_numbered_rule ;;
+      10) run_menu_action enable_ufw_service ;;
+      11) run_menu_action reload_ufw_service ;;
+      12) run_menu_action disable_ufw_service ;;
+      13) run_menu_action uninstall_ufw_service ;;
+      0) return ;;
+      *) warn "无效选项。"; pause ;;
+    esac
+  done
+}
+
+fail2ban_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+Fail2ban 管理 [$(fail2ban_status_badge)]
+
+1) 查看服务与 SSH jail 状态
+2) 安装并启动 Fail2ban
+3) 配置/修改 SSH 防护参数
+4) 校验并重新加载配置
+5) 解封指定 IP
+6) 停止 Fail2ban（危险）
+7) 卸载 Fail2ban（保留配置）
+0) 返回一级菜单
+EOF
+    printf '\n'
+    read -r -p "请选择：" choice
+    case "${choice:-}" in
+      1) run_menu_action show_fail2ban_status ;;
+      2) run_menu_action install_fail2ban_service ;;
+      3) run_menu_action configure_fail2ban ;;
+      4) run_menu_action reload_fail2ban_service ;;
+      5) run_menu_action unban_fail2ban_ip ;;
+      6) run_menu_action stop_fail2ban_service ;;
+      7) run_menu_action uninstall_fail2ban_service ;;
+      0) return ;;
+      *) warn "无效选项。"; pause ;;
+    esac
+  done
+}
+
+menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+SUF ${APP_VERSION} - Server UFW & SSH Fortress (Debian/Ubuntu)
+
+1) SSH 与密钥管理       [$(ssh_status_badge)]
+2) UFW 防火墙管理       [$(ufw_status_badge)]
+3) Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
+4) 查看整体安全状态
+5) 一键安全加固流程
+0) 退出
+EOF
+    printf '\n'
+    read -r -p "请选择服务领域：" choice
+    case "${choice:-}" in
+      1) ssh_menu ;;
+      2) ufw_menu ;;
+      3) fail2ban_menu ;;
+      4) run_menu_action show_status ;;
+      5) run_menu_action all_in_one ;;
+      0) exit 0 ;;
+      *) warn "无效选项。"; pause ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+SUF ${APP_VERSION} - Server UFW & SSH Fortress
+
+用法：
+  suf               打开交互式菜单
+  suf menu          打开交互式菜单
+  suf status        查看整体安全状态
+  suf --version     显示版本
+  suf --help        显示帮助
+
+项目：${APP_REPOSITORY}
+EOF
+}
+
+main() {
+  case "${1:-menu}" in
+    -V|--version|version)
+      printf 'suf %s\n' "$APP_VERSION"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    menu|"")
+      require_root "$@"
+      load_os
+      menu
+      ;;
+    status)
+      require_root "$@"
+      load_os
+      show_status
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
