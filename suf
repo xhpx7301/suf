@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.1.0"
+APP_VERSION="1.1.1"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 SSH_MAIN="/etc/ssh/sshd_config"
@@ -433,7 +433,7 @@ configure_ssh_hardening() {
   confirm "已经放行或服务器没有外部安全组吗？" || die "取消操作。"
 
   if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${target_port}/tcp" comment 'SSH managed by SUF' >/dev/null
+    ufw allow "${target_port}/tcp" comment 'SUF SSH 管理' >/dev/null
     ok "UFW 已放行 TCP/${target_port}。"
   else
     warn "尚未安装 UFW。建议先从菜单安装 UFW，再修改 SSH。"
@@ -456,7 +456,7 @@ allow_extra_ufw_ports() {
       port=${BASH_REMATCH[1]}
       proto=${BASH_REMATCH[2]}
       if valid_port "$port"; then
-        ufw allow "$((10#$port))/${proto}" comment 'Additional service'
+        ufw allow "$((10#$port))/${proto}" comment '额外服务'
         continue
       fi
     fi
@@ -476,14 +476,14 @@ configure_ufw() {
 
   ufw default deny incoming
   ufw default allow outgoing
-  ufw allow "${ssh_port}/tcp" comment 'SSH managed by SUF'
+  ufw allow "${ssh_port}/tcp" comment 'SUF SSH 管理'
   if [[ $current_port != "$ssh_port" ]]; then
-    ufw allow "${current_port}/tcp" comment 'Current SSH temporary'
+    ufw allow "${current_port}/tcp" comment '当前 SSH 临时端口'
   fi
 
   if confirm "这台服务器需要对公网提供 HTTP/HTTPS 吗？"; then
-    ufw allow 80/tcp comment 'HTTP'
-    ufw allow 443/tcp comment 'HTTPS'
+    ufw allow 80/tcp comment '网页 HTTP'
+    ufw allow 443/tcp comment '加密网页 HTTPS'
   fi
   allow_extra_ufw_ports
 
@@ -492,7 +492,7 @@ configure_ufw() {
   confirm "确认以上规则完整，可以启用 UFW 吗？" || die "UFW 尚未启用。"
   ufw --force enable
   ok "UFW 已启用。当前和目标 SSH 端口均已放行，旧规则不会被脚本自动删除。"
-  ufw status verbose
+  show_ufw_status
 }
 
 require_ufw() {
@@ -504,9 +504,44 @@ install_ufw_service() {
   ok "UFW 已安装。安装不会自动启用防火墙。"
 }
 
+translate_ufw_output() {
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    case "$line" in
+      'Status: active') printf '状态：已启用\n'; continue ;;
+      'Status: inactive') printf '状态：未启用\n'; continue ;;
+      To*Action*From) printf '目标                         操作          来源\n'; continue ;;
+    esac
+
+    line=${line//Default: /默认策略：}
+    line=${line//Logging: /日志记录：}
+    line=${line//deny \(incoming\)/拒绝（入站）}
+    line=${line//allow \(incoming\)/允许（入站）}
+    line=${line//allow \(outgoing\)/允许（出站）}
+    line=${line//deny \(outgoing\)/拒绝（出站）}
+    line=${line//disabled \(routed\)/禁用（转发）}
+    line=${line//allow \(routed\)/允许（转发）}
+    line=${line//deny \(routed\)/拒绝（转发）}
+    line=${line//Anywhere \(v6\)/任意来源（IPv6）}
+    line=${line//Anywhere/任意来源}
+    line=${line//ALLOW IN/允许入站}
+    line=${line//DENY IN/拒绝入站}
+    line=${line//REJECT IN/拒绝并通知入站}
+    line=${line//LIMIT IN/限制入站连接}
+    line=${line//ALLOW OUT/允许出站}
+    line=${line//DENY OUT/拒绝出站}
+    line=${line//on \(low\)/开启（低）}
+    line=${line//on \(medium\)/开启（中）}
+    line=${line//on \(high\)/开启（高）}
+    line=${line//off/关闭}
+    printf '%s\n' "$line"
+  done
+}
+
 show_ufw_status() {
   if command -v ufw >/dev/null 2>&1; then
-    ufw status verbose
+    printf 'UFW 防火墙状态\n'
+    ufw status verbose | translate_ufw_output
   else
     printf 'UFW：未安装\n'
   fi
@@ -514,8 +549,9 @@ show_ufw_status() {
 
 show_ufw_rules() {
   require_ufw
-  ufw status numbered
-  printf '\n脚本添加形式：\n'
+  printf 'UFW 规则（按编号）\n'
+  ufw status numbered | translate_ufw_output
+  printf '\n待应用的底层 UFW 规则命令：\n'
   ufw show added || true
 }
 
@@ -533,7 +569,7 @@ ufw_allow_port() {
   require_ufw
   port=$(prompt_port 443)
   protocol=$(prompt_protocol)
-  ufw allow "${port}/${protocol}" comment 'Managed service'
+  ufw allow "${port}/${protocol}" comment '受 SUF 管理的服务'
   ok "已放行 ${port}/${protocol}。"
 }
 
@@ -575,7 +611,7 @@ ufw_allow_source_to_port() {
   protocol=$(prompt_protocol)
 
   # UFW performs the final IPv4/IPv6 and CIDR validation.
-  ufw allow from "$source" to any port "$port" proto "$protocol" comment 'Restricted source'
+  ufw allow from "$source" to any port "$port" proto "$protocol" comment '仅限指定来源'
   remove_broad_ufw_allows "$port" "$protocol"
   ok "已限制为 ${source} 可访问 ${port}/${protocol}。"
 }
@@ -584,20 +620,20 @@ ufw_limit_port() {
   local port
   require_ufw
   port=$(prompt_port 22)
-  ufw limit "${port}/tcp" comment 'Rate limited service'
+  ufw limit "${port}/tcp" comment '连接限速服务'
   ok "已为 ${port}/tcp 添加连接限速规则。UFW limit 仅用于 TCP 连接。"
 }
 
 ufw_delete_numbered_rule() {
   local number
   require_ufw
-  ufw status numbered
+  show_ufw_rules
   read -r -p "要删除的规则编号：" number
   [[ $number =~ ^[0-9]+$ ]] && ((10#$number > 0)) || die "规则编号无效。"
   warn "删除后其他规则编号会变化。"
   confirm "确认删除规则 ${number} 吗？" || die "取消删除。"
   ufw --force delete "$((10#$number))"
-  ufw status numbered
+  show_ufw_rules
 }
 
 ufw_is_active() {
@@ -619,11 +655,11 @@ enable_ufw_service() {
 
   if [[ -n ${SSH_CONNECTION:-} && $source_ip =~ ^[0-9A-Fa-f:.]+$ ]]; then
     info "为当前 SSH 来源 ${source_ip} 保留 TCP/${ssh_port} 访问权限。"
-    ufw insert 1 allow from "$source_ip" to any port "$ssh_port" proto tcp comment 'Current SSH client'
+    ufw insert 1 allow from "$source_ip" to any port "$ssh_port" proto tcp comment '当前 SSH 客户端'
   else
     warn "未检测到当前 SSH 来源，将放行所有来源访问 TCP/${ssh_port}。"
     confirm "确认按此方式保护当前管理入口吗？" || die "取消启用。"
-    ufw insert 1 allow "${ssh_port}/tcp" comment 'SSH management'
+    ufw insert 1 allow "${ssh_port}/tcp" comment 'SSH 管理入口'
   fi
 
   warn "UFW 启用后，未明确放行的入站端口将被阻止。"
@@ -632,7 +668,7 @@ enable_ufw_service() {
   read -r -p "确认规则完整请输入 ENABLE-UFW：" confirmation
   [[ $confirmation == ENABLE-UFW ]] || die "未启用 UFW。"
   ufw --force enable
-  ufw status verbose
+  show_ufw_status
 }
 
 reload_ufw_service() {
@@ -703,8 +739,13 @@ EOF
     fi
     die "Fail2ban 配置校验失败，已恢复原配置。"
   fi
-  systemctl enable --now fail2ban
-  systemctl restart fail2ban
+  systemctl enable fail2ban
+  systemctl reset-failed fail2ban || true
+  if ! systemctl restart fail2ban; then
+    show_fail2ban_start_diagnostics
+    die "Fail2ban SSH 防护规则未启用。"
+  fi
+  ensure_fail2ban_running
   ok "Fail2ban SSH 防护已启用。"
   fail2ban-client status sshd || true
 }
@@ -713,9 +754,31 @@ require_fail2ban() {
   command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装，请先选择安装。"
 }
 
+show_fail2ban_start_diagnostics() {
+  warn "Fail2ban 未能保持运行，以下是 systemd 诊断信息："
+  systemctl status fail2ban --no-pager -l || true
+  printf '\n最近的 Fail2ban 日志：\n'
+  journalctl -u fail2ban -b -n 80 --no-pager || true
+}
+
+ensure_fail2ban_running() {
+  # Fail2ban may report active briefly before a jail initialization failure exits.
+  sleep 1
+  if ! systemctl is-active --quiet fail2ban; then
+    show_fail2ban_start_diagnostics
+    die "Fail2ban 启动失败；请根据以上日志修复后再重试。"
+  fi
+}
+
 install_fail2ban_service() {
   apt_install fail2ban
-  systemctl enable --now fail2ban
+  systemctl enable fail2ban
+  systemctl reset-failed fail2ban || true
+  if ! systemctl start fail2ban; then
+    show_fail2ban_start_diagnostics
+    die "Fail2ban 启动失败，未显示为已启用。"
+  fi
+  ensure_fail2ban_running
   ok "Fail2ban 已安装并启动。下一步请配置 SSH 防护规则。"
 }
 
@@ -736,8 +799,14 @@ reload_fail2ban_service() {
   if systemctl is-active --quiet fail2ban; then
     fail2ban-client reload
   else
-    systemctl enable --now fail2ban
+    systemctl enable fail2ban
+    systemctl reset-failed fail2ban || true
+    if ! systemctl start fail2ban; then
+      show_fail2ban_start_diagnostics
+      die "Fail2ban 启动失败，未重新加载配置。"
+    fi
   fi
+  ensure_fail2ban_running
   ok "Fail2ban 配置已重新加载。"
 }
 
@@ -919,7 +988,7 @@ show_status() {
 
   printf '\nUFW：\n'
   if command -v ufw >/dev/null 2>&1; then
-    ufw status verbose || true
+    show_ufw_status || true
   else
     printf '  未安装\n'
   fi
@@ -950,13 +1019,13 @@ all_in_one() {
   apt_install ufw fail2ban
   ufw default deny incoming
   ufw default allow outgoing
-  ufw allow "${target_port}/tcp" comment 'SSH managed by SUF'
+  ufw allow "${target_port}/tcp" comment 'SUF SSH 管理'
   if [[ $current_port != "$target_port" ]]; then
-    ufw allow "${current_port}/tcp" comment 'Current SSH temporary'
+    ufw allow "${current_port}/tcp" comment '当前 SSH 临时端口'
   fi
   if confirm "需要开放 HTTP/HTTPS 端口吗？"; then
-    ufw allow 80/tcp comment 'HTTP'
-    ufw allow 443/tcp comment 'HTTPS'
+    ufw allow 80/tcp comment '网页 HTTP'
+    ufw allow 443/tcp comment '加密网页 HTTPS'
   fi
   allow_extra_ufw_ports
   warn "启用后，未明确放行的入站端口将被阻止。"
