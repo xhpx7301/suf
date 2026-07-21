@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.1.7"
+APP_VERSION="1.2.0"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 SSH_MAIN="/etc/ssh/sshd_config"
@@ -163,9 +163,9 @@ valid_port() {
 }
 
 prompt_port() {
-  local default_port=$1 entered
+  local default_port=$1 label=${2:-端口} entered
   while true; do
-    read -r -p "SSH 端口 [${default_port}]：" entered
+    read -r -p "${label} [${default_port}]：" entered
     entered=${entered:-$default_port}
     if valid_port "$entered"; then
       printf '%s\n' "$((10#$entered))"
@@ -530,7 +530,7 @@ change_ssh_port() {
   local current_port target_port
   ensure_openssh
   current_port=$(current_ssh_port)
-  target_port=$(prompt_port "$current_port")
+  target_port=$(prompt_port "$current_port" "SSH 端口")
   [[ $target_port != "$current_port" ]] || {
     info "目标端口与当前端口相同，未做修改。"
     return
@@ -576,7 +576,7 @@ configure_ufw() {
   apt_install ufw
   ensure_openssh
   current_port=$(current_ssh_port)
-  ssh_port=$(prompt_port "$current_port")
+  ssh_port=$(prompt_port "$current_port" "SSH 端口")
 
   warn "请确保云安全组同时放行 TCP/${ssh_port}。"
   confirm "确认继续配置 UFW 吗？" || die "取消操作。"
@@ -764,7 +764,7 @@ show_listening_ports() {
 ufw_allow_port() {
   local port protocol
   require_ufw
-  port=$(prompt_port 443)
+  port=$(prompt_port 443 "要放行的端口")
   protocol=$(prompt_protocol)
   ufw allow "${port}/${protocol}" comment '受 SUF 管理的服务'
   ok "已放行 ${port}/${protocol}。"
@@ -804,7 +804,7 @@ ufw_allow_source_to_port() {
   require_ufw
   read -r -p "允许的来源 IP 或 CIDR：" source
   [[ $source =~ ^[0-9A-Fa-f:./]+$ ]] || die "IP/CIDR 包含无效字符。"
-  port=$(prompt_port 22)
+  port=$(prompt_port 22 "要限制来源的端口")
   protocol=$(prompt_protocol)
 
   # UFW performs the final IPv4/IPv6 and CIDR validation.
@@ -814,9 +814,11 @@ ufw_allow_source_to_port() {
 }
 
 ufw_limit_port() {
-  local port
+  local default_port port
   require_ufw
-  port=$(prompt_port 22)
+  ensure_openssh
+  default_port=$(current_ssh_port)
+  port=$(prompt_port "$default_port" "要限制新连接的 TCP 端口")
   ufw limit "${port}/tcp" comment '连接限速服务'
   ok "已为 ${port}/tcp 添加连接限速规则。UFW limit 仅用于 TCP 连接。"
 }
@@ -875,11 +877,9 @@ reload_ufw_service() {
 }
 
 disable_ufw_service() {
-  local confirmation
   require_ufw
   warn "关闭 UFW 会让监听端口失去这层防火墙保护。"
-  read -r -p "确认关闭请输入 DISABLE-UFW：" confirmation
-  [[ $confirmation == DISABLE-UFW ]] || die "取消关闭。"
+  confirm "确认关闭 UFW 吗？" || die "取消关闭。"
   ufw --force disable
   ok "UFW 已关闭。"
 }
@@ -893,23 +893,29 @@ uninstall_ufw_service() {
   ok "UFW 软件包已移除，配置文件仍保留。"
 }
 
-configure_fail2ban() {
-  local default_port ssh_port maxretry findtime bantime
-  local jail_file=$FAIL2BAN_JAIL_FILE
-  local backup_file=""
-  apt_install fail2ban python3-systemd
-  ensure_openssh
-  default_port=$(current_ssh_port)
-  ssh_port=$(prompt_port "$default_port")
-  maxretry=$(prompt_positive_integer "最大失败次数" 5)
-  findtime=$(prompt_duration "统计时间窗口" 10m)
-  bantime=$(prompt_duration "首次封禁时间" 1h)
+backup_fail2ban_jail() {
+  local jail_file=$1 backup_file
+  [[ -e $jail_file ]] || return 0
+  mkdir -p "${BACKUP_ROOT}/fail2ban"
+  backup_file="${BACKUP_ROOT}/fail2ban/suf.$(date +%Y%m%d-%H%M%S).local"
+  cp -a "$jail_file" "$backup_file"
+  printf '%s\n' "$backup_file"
+}
 
-  if [[ -e $jail_file ]]; then
-    mkdir -p "${BACKUP_ROOT}/fail2ban"
-    backup_file="${BACKUP_ROOT}/fail2ban/suf.$(date +%Y%m%d-%H%M%S).local"
-    cp -a "$jail_file" "$backup_file"
+restore_fail2ban_jail() {
+  local jail_file=$1 backup_file=$2
+  if [[ -n $backup_file ]]; then
+    cp -a "$backup_file" "$jail_file"
+  else
+    rm -f "$jail_file"
   fi
+}
+
+configure_fail2ban_sshd() {
+  local ssh_port=$1 maxretry=$2 findtime=$3 bantime=$4
+  local jail_file=$FAIL2BAN_JAIL_FILE backup_file
+  mkdir -p "$FAIL2BAN_JAIL_DIR"
+  backup_file=$(backup_fail2ban_jail "$jail_file")
 
   cat >"$jail_file" <<EOF
 [sshd]
@@ -926,21 +932,40 @@ EOF
   chown root:root "$jail_file"
 
   if ! fail2ban-client -t; then
-    if [[ -n $backup_file ]]; then
-      cp -a "$backup_file" "$jail_file"
-    else
-      rm -f "$jail_file"
-    fi
+    restore_fail2ban_jail "$jail_file" "$backup_file"
     die "Fail2ban 配置校验失败，已恢复原配置。"
   fi
   systemctl enable fail2ban
   systemctl reset-failed fail2ban || true
   if ! systemctl restart fail2ban; then
+    restore_fail2ban_jail "$jail_file" "$backup_file"
+    fail2ban-client -t && systemctl restart fail2ban || true
     show_fail2ban_start_diagnostics
-    die "Fail2ban SSH 防护规则未启用。"
+    die "Fail2ban SSH 防护规则未启用，已恢复原配置。"
   fi
-  ensure_fail2ban_running
+
+  sleep 1
+  if ! systemctl is-active --quiet fail2ban; then
+    restore_fail2ban_jail "$jail_file" "$backup_file"
+    fail2ban-client -t && systemctl restart fail2ban || true
+    show_fail2ban_start_diagnostics
+    die "Fail2ban 启动后退出，已恢复原配置。"
+  fi
+
   ok "Fail2ban SSH 防护已启用。"
+}
+
+configure_fail2ban() {
+  local ssh_port maxretry findtime bantime
+  apt_install fail2ban python3-systemd
+  ensure_openssh
+  ssh_port=$(current_ssh_port)
+  info "已检测到当前 SSH 端口：${ssh_port}，Fail2ban 将保护此端口。"
+  maxretry=$(prompt_positive_integer "最大失败次数" 5)
+  findtime=$(prompt_duration "统计时间窗口" 10m)
+  bantime=$(prompt_duration "首次封禁时间" 1h)
+
+  configure_fail2ban_sshd "$ssh_port" "$maxretry" "$findtime" "$bantime"
   show_fail2ban_sshd_status
 }
 
@@ -1084,21 +1109,17 @@ unban_fail2ban_ip() {
 }
 
 stop_fail2ban_service() {
-  local confirmation
   require_fail2ban
   warn "停止 Fail2ban 后将不再自动封禁新的攻击来源。"
-  read -r -p "确认停止请输入 STOP-FAIL2BAN：" confirmation
-  [[ $confirmation == STOP-FAIL2BAN ]] || die "取消停止。"
+  confirm "确认停止 Fail2ban 吗？" || die "取消停止。"
   systemctl disable --now fail2ban
   ok "Fail2ban 已停止并取消开机启动。"
 }
 
 uninstall_fail2ban_service() {
-  local confirmation
   require_fail2ban
   warn "将停止 Fail2ban 并移除软件包，但保留 /etc/fail2ban 配置。"
-  read -r -p "确认卸载请输入 UNINSTALL-FAIL2BAN：" confirmation
-  [[ $confirmation == UNINSTALL-FAIL2BAN ]] || die "取消卸载。"
+  confirm "确认卸载 Fail2ban 并保留配置吗？" || die "取消卸载。"
   systemctl disable --now fail2ban || true
   DEBIAN_FRONTEND=noninteractive apt-get remove -y fail2ban
   ok "Fail2ban 软件包已移除，配置文件仍保留。"
@@ -1261,8 +1282,26 @@ show_status() {
   show_fail2ban_status
 }
 
-all_in_one() {
-  local target_user current_port target_port confirmation
+show_security_setup_preview() {
+  cat <<'EOF'
+安全初始化向导将执行以下步骤：
+
+  1. 安装公钥，并要求在第二个终端验证密钥登录。
+  2. 选择 SSH 端口；请先在云安全组放行该端口。
+  3. 显示当前监听端口，安装并启用 UFW。
+     新 SSH 端口和当前 SSH 端口会自动放行。
+  4. 启用仅密钥 SSH 登录，并在修改前备份配置。
+  5. 安装并配置 Fail2ban 的 SSH 防护规则。
+
+仅建议用于新服务器或已确认全部公网服务端口的服务器。
+EOF
+}
+
+security_initialization_wizard() {
+  local target_user current_port target_port
+  show_security_setup_preview
+  confirm "确认执行安全初始化向导吗？" || die "取消安全初始化。"
+
   ensure_openssh
   install_public_key
 
@@ -1270,12 +1309,12 @@ all_in_one() {
   require_tested_key_login "$target_user"
 
   current_port=$(current_ssh_port)
-  target_port=$(prompt_port "$current_port")
+  target_port=$(prompt_port "$current_port" "SSH 端口")
   warn "请先在云安全组放行 TCP/${target_port}，当前 SSH 会话不要关闭。"
-  read -r -p "完成后输入 FIREWALL-READY：" confirmation
-  [[ $confirmation == FIREWALL-READY ]] || die "未确认云防火墙，取消操作。"
+  confirm "已经放行或服务器没有外部安全组吗？" || die "未确认云防火墙，取消操作。"
 
   apt_install ufw fail2ban python3-systemd
+  show_listening_ports
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow "${target_port}/tcp" comment 'SUF SSH 管理'
@@ -1294,23 +1333,9 @@ all_in_one() {
 
   write_sshd_hardening "$target_port" "$target_user"
 
-  cat >"$FAIL2BAN_JAIL_FILE" <<EOF
-[sshd]
-enabled = true
-port = ${target_port}
-backend = systemd
-maxretry = 5
-findtime = 10m
-bantime = 1h
-bantime.increment = true
-bantime.factor = 2
-EOF
-  chmod 600 "$FAIL2BAN_JAIL_FILE"
-  fail2ban-client -t
-  systemctl enable --now fail2ban
-  systemctl restart fail2ban
+  configure_fail2ban_sshd "$target_port" 5 10m 1h
 
-  ok "一键加固完成。"
+  ok "安全初始化完成。"
   warn "不要关闭当前会话，先测试：ssh -p ${target_port} ${target_user}@服务器IP"
   warn "确认新连接成功后，再手动删除 UFW 中不需要的旧 SSH 端口规则。"
 }
@@ -1375,7 +1400,7 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （1）查看状态
 （2）安装 UFW
 （3）启用 UFW
-（4）关闭 UFW（危险）
+（4）关闭 UFW
 （5）卸载 UFW（保留配置）
 （6）查看编号规则
 （7）删除编号规则
@@ -1420,7 +1445,7 @@ Fail2ban 管理 [$(fail2ban_status_badge)]
 （3）配置/修改 SSH 防护参数
 （4）校验并重新加载配置
 （5）解封指定 IP
-（6）停止 Fail2ban（危险）
+（6）停止 Fail2ban
 （7）卸载 Fail2ban（保留配置）
 （0）返回一级菜单
 EOF
@@ -1450,7 +1475,7 @@ SUF ${APP_VERSION} - Server UFW & SSH Fortress (Debian/Ubuntu)
 （2）UFW 防火墙管理       [$(ufw_status_badge)]
 （3）Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
 （4）查看整体安全状态
-（5）一键安全加固流程
+（5）安全初始化向导
 （6）更新 SUF 项目
 （0）退出
 EOF
@@ -1461,7 +1486,7 @@ EOF
       2) ufw_menu ;;
       3) fail2ban_menu ;;
       4) run_menu_action show_status ;;
-      5) run_menu_action all_in_one ;;
+      5) run_menu_action security_initialization_wizard ;;
       6) run_menu_action update_suf_project ;;
       0) exit 0 ;;
       *) warn "无效选项。"; pause ;;
