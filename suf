@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.1.2"
+APP_VERSION="1.1.3"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 SSH_MAIN="/etc/ssh/sshd_config"
@@ -555,13 +555,103 @@ show_ufw_rules() {
   ufw show added || true
 }
 
+show_ufw_allowed_ports() {
+  local found=0 line rule
+  require_ufw
+
+  printf 'UFW 已保存的放行/限速端口\n'
+  if ! ufw_is_active; then
+    warn "UFW 当前未启用；以下规则将在启用后生效。"
+  fi
+
+  while IFS= read -r line; do
+    case "$line" in
+      'ufw allow '*)
+        rule=${line#ufw allow }
+        rule=${rule// from /，来源 }
+        rule=${rule// to any port /，目标端口 }
+        rule=${rule// proto /，协议 }
+        rule=${rule// comment /，备注 }
+        printf '  放行：%s\n' "$rule"
+        found=1
+        ;;
+      'ufw limit '*)
+        rule=${line#ufw limit }
+        rule=${rule// comment /，备注 }
+        printf '  限速：%s\n' "$rule"
+        found=1
+        ;;
+    esac
+  done < <(ufw show added 2>/dev/null || true)
+
+  ((found)) || printf '  没有保存的放行或连接限速规则。\n'
+}
+
+public_listening_candidates() {
+  ss -H -lntu 2>/dev/null | awk '
+    $1 ~ /^(tcp|udp)$/ {
+      local_address = $5
+      port = local_address
+      sub(/^.*:/, "", port)
+      host = local_address
+      sub(/:[^:]*$/, "", host)
+      gsub(/^\[/, "", host)
+      gsub(/\]$/, "", host)
+      if (host !~ /^127\./ && host != "::1") {
+        printf "%s %s %s\n", $1, port, host
+      }
+    }
+  ' | sort -u
+}
+
+is_public_listening_port() {
+  local port=$1 protocol=$2
+  public_listening_candidates | awk -v wanted_port="$port" -v wanted_protocol="$protocol" '
+    $1 == wanted_protocol && $2 == wanted_port { found = 1 }
+    END { exit !found }
+  '
+}
+
 show_listening_ports() {
+  local candidates port protocol
   printf '以下是实际监听端口，不代表已被 UFW 放行：\n\n'
   if command -v ss >/dev/null 2>&1; then
+    candidates=$(public_listening_candidates || true)
+    if [[ -n $candidates ]]; then
+      printf '可考虑对公网放行的监听端口（协议 / 端口 / 绑定地址）：\n'
+      awk '{ printf "  %-4s %-7s %s\n", $1, $2, $3 }' <<<"$candidates"
+      printf '\n'
+    else
+      printf '没有检测到对公网或指定网卡监听的端口。\n\n'
+    fi
+
+    printf '完整监听详情：\n'
     ss -lntup
   else
     die "未找到 ss，请安装 iproute2。"
   fi
+
+  command -v ufw >/dev/null 2>&1 || {
+    info "安装 UFW 后，可从此处选择监听端口加入放行规则。"
+    return
+  }
+  [[ -n $candidates ]] || return
+  confirm "要从上述公网监听端口中选择一个加入 UFW 放行规则吗？" || return
+
+  read -r -p "输入要放行的端口号：" port
+  valid_port "$port" || die "端口必须是 1 到 65535 的整数。"
+  port=$((10#$port))
+  protocol=$(prompt_protocol)
+
+  is_public_listening_port "$port" "$protocol" || die "未检测到 ${port}/${protocol} 的公网监听；仅本机监听的服务不能通过此菜单开放。"
+  if ufw show added | grep -Eq "^ufw (allow|limit) ${port}/${protocol}([[:space:]]|$)"; then
+    warn "已存在 ${port}/${protocol} 的广泛放行或限速规则，未重复添加。"
+  else
+    ufw allow "${port}/${protocol}" comment '从监听服务放行'
+    ok "已将正在监听的 ${port}/${protocol} 加入 UFW 放行规则。"
+  fi
+  printf '\n'
+  show_ufw_allowed_ports
 }
 
 ufw_allow_port() {
@@ -1113,17 +1203,18 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 
 1) 查看状态
 2) 查看编号规则
-3) 查看实际监听端口
-4) 安装 UFW
-5) 引导式初始配置
-6) 放行端口
-7) 仅允许指定 IP/CIDR 访问端口
-8) 为端口添加连接限速
-9) 删除编号规则
-10) 启用 UFW
-11) 重新加载规则
-12) 关闭 UFW（危险）
-13) 卸载 UFW（保留配置）
+3) 查看实际监听端口并按需放行
+4) 查看 UFW 已放行端口
+5) 安装 UFW
+6) 引导式初始配置
+7) 放行端口
+8) 仅允许指定 IP/CIDR 访问端口
+9) 为端口添加连接限速
+10) 删除编号规则
+11) 启用 UFW
+12) 重新加载规则
+13) 关闭 UFW（危险）
+14) 卸载 UFW（保留配置）
 0) 返回一级菜单
 EOF
     printf '\n'
@@ -1132,16 +1223,17 @@ EOF
       1) run_menu_action show_ufw_status ;;
       2) run_menu_action show_ufw_rules ;;
       3) run_menu_action show_listening_ports ;;
-      4) run_menu_action install_ufw_service ;;
-      5) run_menu_action configure_ufw ;;
-      6) run_menu_action ufw_allow_port ;;
-      7) run_menu_action ufw_allow_source_to_port ;;
-      8) run_menu_action ufw_limit_port ;;
-      9) run_menu_action ufw_delete_numbered_rule ;;
-      10) run_menu_action enable_ufw_service ;;
-      11) run_menu_action reload_ufw_service ;;
-      12) run_menu_action disable_ufw_service ;;
-      13) run_menu_action uninstall_ufw_service ;;
+      4) run_menu_action show_ufw_allowed_ports ;;
+      5) run_menu_action install_ufw_service ;;
+      6) run_menu_action configure_ufw ;;
+      7) run_menu_action ufw_allow_port ;;
+      8) run_menu_action ufw_allow_source_to_port ;;
+      9) run_menu_action ufw_limit_port ;;
+      10) run_menu_action ufw_delete_numbered_rule ;;
+      11) run_menu_action enable_ufw_service ;;
+      12) run_menu_action reload_ufw_service ;;
+      13) run_menu_action disable_ufw_service ;;
+      14) run_menu_action uninstall_ufw_service ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
