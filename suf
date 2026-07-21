@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.1.4"
+APP_VERSION="1.1.7"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 SSH_MAIN="/etc/ssh/sshd_config"
@@ -77,6 +77,48 @@ apt_install() {
   info "安装软件包：${missing[*]}"
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+}
+
+suf_project_dir() {
+  local sudo_home
+  if [[ -n ${SUF_HOME:-} ]]; then
+    printf '%s\n' "$SUF_HOME"
+    return
+  fi
+
+  if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    sudo_home=$(user_home "$SUDO_USER")
+    if [[ -n $sudo_home ]]; then
+      printf '%s/suf\n' "$sudo_home"
+      return
+    fi
+  fi
+
+  printf '%s/suf\n' "$HOME"
+}
+
+update_suf_project() {
+  local project_dir origin
+  project_dir=$(suf_project_dir)
+  apt_install git
+
+  [[ ! -L $project_dir ]] || die "${project_dir} 是符号链接，拒绝更新。"
+  if [[ -d ${project_dir}/.git ]]; then
+    origin=$(git -C "$project_dir" remote get-url origin 2>/dev/null || true)
+    [[ $origin == "${APP_REPOSITORY}.git" ]] || die "${project_dir} 的远程仓库不是 ${APP_REPOSITORY}。"
+    [[ -z $(git -C "$project_dir" status --porcelain) ]] || die "${project_dir} 存在未提交修改，请先处理后再更新。"
+    info "正在从 GitHub 获取 SUF 更新..."
+    git -C "$project_dir" pull --ff-only
+  elif [[ -e $project_dir ]]; then
+    die "${project_dir} 已存在但不是 SUF Git 仓库，拒绝覆盖。"
+  else
+    info "未找到本地 SUF 仓库，正在克隆..."
+    git clone --depth 1 "${APP_REPOSITORY}.git" "$project_dir"
+  fi
+
+  [[ -f ${project_dir}/install.sh && -f ${project_dir}/suf ]] || die "SUF 仓库内容不完整，未执行安装。"
+  bash "${project_dir}/install.sh" --no-launch
+  ok "SUF 已更新。退出后重新执行 suf 即可使用新版本。"
 }
 
 find_sshd_bin() {
@@ -336,8 +378,8 @@ require_tested_key_login() {
   else
     warn "只有在第二个终端已用 ${target_user} 的密钥登录并成功执行 sudo -v 后才能继续。"
   fi
-  read -r -p "确认已完成测试请输入 TESTED：" confirmation
-  [[ $confirmation == TESTED ]] || die "未确认测试，取消 SSH 加固。"
+  read -r -p "确认已完成测试？[y/N]：" confirmation
+  [[ ${confirmation:-n} =~ ^[Yy]$ ]] || die "未确认测试，取消 SSH 加固。"
 }
 
 write_sshd_hardening() {
@@ -421,16 +463,79 @@ EOF
   printf '  ssh -p %s %s@服务器IP\n' "$port" "$target_user"
 }
 
-configure_ssh_hardening() {
-  local current_port target_port target_user
+enable_key_only_login() {
+  local current_port target_user
   ensure_openssh
   current_port=$(current_ssh_port)
   read -r -p "已验证密钥登录的用户名 [root]：" target_user
   target_user=${target_user:-root}
   require_tested_key_login "$target_user"
-  target_port=$(prompt_port "$current_port")
 
   warn "应用后将禁止所有 SSH 密码和键盘交互认证，只保留公钥登录。"
+  write_sshd_hardening "$current_port" "$target_user"
+}
+
+write_sshd_port() {
+  local port=$1 backup_dir effective tmp
+  backup_dir=$(backup_ssh_config)
+  mkdir -p "$SSH_DROPIN_DIR"
+  ensure_dropin_include_first
+
+  tmp=$(mktemp)
+  if [[ -e $SSH_DROPIN ]]; then
+    awk -v port="$port" '
+      tolower($1) == "port" {
+        if (!written++) print "Port " port
+        next
+      }
+      { print }
+      END {
+        if (!written) print "Port " port
+      }
+    ' "$SSH_DROPIN" >"$tmp"
+  else
+    printf '# Managed by SUF %s\nPort %s\n' "$APP_VERSION" "$port" >"$tmp"
+  fi
+  install -m 600 -o root -g root "$tmp" "$SSH_DROPIN"
+  rm -f "$tmp"
+
+  if ! "$SSHD_BIN" -t; then
+    warn "sshd 配置校验失败，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "旧配置恢复后仍无法通过校验，请保持当前会话并人工检查 ${SSH_MAIN}。"
+    die "没有应用任何 SSH 变更。"
+  fi
+
+  effective=$(effective_sshd_value port)
+  if [[ $effective != "$port" ]]; then
+    warn "最终 SSH 端口未生效，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
+    die "没有应用任何 SSH 变更。"
+  fi
+
+  if ! systemctl reload "$SSH_SERVICE"; then
+    warn "SSH 配置重新加载失败，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t && systemctl reload "$SSH_SERVICE" || die "自动恢复失败；不要关闭当前 SSH 会话。"
+    die "SSH 端口变更已撤销。"
+  fi
+
+  ok "SSH 端口已修改为 ${port}，认证策略未做改变。"
+  info "原 SSH 配置备份位于 ${backup_dir}。"
+  warn "不要关闭当前会话。请在新终端测试：ssh -p ${port} 用户名@服务器IP"
+}
+
+change_ssh_port() {
+  local current_port target_port
+  ensure_openssh
+  current_port=$(current_ssh_port)
+  target_port=$(prompt_port "$current_port")
+  [[ $target_port != "$current_port" ]] || {
+    info "目标端口与当前端口相同，未做修改。"
+    return
+  }
+
   warn "请先确认云厂商安全组已放行 TCP/${target_port}。"
   confirm "已经放行或服务器没有外部安全组吗？" || die "取消操作。"
 
@@ -442,7 +547,7 @@ configure_ssh_hardening() {
     confirm "仍要继续吗？" || die "取消操作。"
   fi
 
-  write_sshd_hardening "$target_port" "$target_user"
+  write_sshd_port "$target_port"
 }
 
 allow_extra_ufw_ports() {
@@ -773,7 +878,6 @@ disable_ufw_service() {
   local confirmation
   require_ufw
   warn "关闭 UFW 会让监听端口失去这层防火墙保护。"
-  show_listening_ports
   read -r -p "确认关闭请输入 DISABLE-UFW：" confirmation
   [[ $confirmation == DISABLE-UFW ]] || die "取消关闭。"
   ufw --force disable
@@ -781,11 +885,9 @@ disable_ufw_service() {
 }
 
 uninstall_ufw_service() {
-  local confirmation
   require_ufw
   warn "将关闭 UFW 并移除软件包，但保留 /etc/ufw 配置文件。"
-  read -r -p "确认卸载请输入 UNINSTALL-UFW：" confirmation
-  [[ $confirmation == UNINSTALL-UFW ]] || die "取消卸载。"
+  confirm "确认卸载 UFW 并保留配置吗？" || die "取消卸载。"
   ufw --force disable || true
   DEBIAN_FRONTEND=noninteractive apt-get remove -y ufw
   ok "UFW 软件包已移除，配置文件仍保留。"
@@ -1234,13 +1336,14 @@ ssh_menu() {
     cat <<EOF
 SSH 与密钥管理 [$(ssh_status_badge)]
 
-1) 查看 SSH 状态与安全配置
-2) 安装/修复 OpenSSH 服务
-3) 为登录用户安装公钥（默认 root）
-4) 启用仅密钥登录或修改端口
-5) 校验并重新加载 SSH
-6) 恢复最近一次 SSH 配置备份
-0) 返回一级菜单
+（1）查看 SSH 状态与安全配置
+（2）安装/修复 OpenSSH 服务
+（3）为登录用户安装公钥（默认 root）
+（4）启用仅密钥登录
+（5）修改 SSH 端口
+（6）校验并重新加载 SSH
+（7）恢复最近一次 SSH 配置备份
+（0）返回一级菜单
 EOF
     printf '\n'
     read -r -p "请选择：" choice
@@ -1248,9 +1351,10 @@ EOF
       1) run_menu_action show_ssh_status ;;
       2) run_menu_action install_openssh_service ;;
       3) run_menu_action ensure_openssh_and_key ;;
-      4) run_menu_action configure_ssh_hardening ;;
-      5) run_menu_action reload_ssh_service ;;
-      6) run_menu_action restore_latest_ssh_backup ;;
+      4) run_menu_action enable_key_only_login ;;
+      5) run_menu_action change_ssh_port ;;
+      6) run_menu_action reload_ssh_service ;;
+      7) run_menu_action restore_latest_ssh_backup ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
@@ -1268,39 +1372,37 @@ ufw_menu() {
     cat <<EOF
 UFW 防火墙管理 [$(ufw_status_badge)]
 
-1) 查看状态
-2) 查看编号规则
-3) 查看实际监听端口并按需放行
-4) 查看 UFW 已放行端口
-5) 安装 UFW
-6) 引导式初始配置
-7) 放行端口
-8) 仅允许指定 IP/CIDR 访问端口
-9) 为端口添加连接限速
-10) 删除编号规则
-11) 启用 UFW
-12) 重新加载规则
-13) 关闭 UFW（危险）
-14) 卸载 UFW（保留配置）
-0) 返回一级菜单
+（1）查看状态
+（2）安装 UFW
+（3）启用 UFW
+（4）关闭 UFW（危险）
+（5）卸载 UFW（保留配置）
+（6）查看编号规则
+（7）删除编号规则
+（8）重新加载规则
+（9）查看 UFW 已放行端口
+（10）查看实际监听端口并按需放行
+（11）放行指定端口
+（12）仅允许指定 IP/CIDR 访问端口
+（13）为端口添加连接限速
+（0）返回一级菜单
 EOF
     printf '\n'
     read -r -p "请选择：" choice
     case "${choice:-}" in
       1) run_menu_action show_ufw_status ;;
-      2) run_menu_action show_ufw_rules ;;
-      3) run_menu_action show_listening_ports ;;
-      4) run_menu_action show_ufw_allowed_ports ;;
-      5) run_menu_action install_ufw_service ;;
-      6) run_menu_action configure_ufw ;;
-      7) run_menu_action ufw_allow_port ;;
-      8) run_menu_action ufw_allow_source_to_port ;;
-      9) run_menu_action ufw_limit_port ;;
-      10) run_menu_action ufw_delete_numbered_rule ;;
-      11) run_menu_action enable_ufw_service ;;
-      12) run_menu_action reload_ufw_service ;;
-      13) run_menu_action disable_ufw_service ;;
-      14) run_menu_action uninstall_ufw_service ;;
+      2) run_menu_action install_ufw_service ;;
+      3) run_menu_action enable_ufw_service ;;
+      4) run_menu_action disable_ufw_service ;;
+      5) run_menu_action uninstall_ufw_service ;;
+      6) run_menu_action show_ufw_rules ;;
+      7) run_menu_action ufw_delete_numbered_rule ;;
+      8) run_menu_action reload_ufw_service ;;
+      9) run_menu_action show_ufw_allowed_ports ;;
+      10) run_menu_action show_listening_ports ;;
+      11) run_menu_action ufw_allow_port ;;
+      12) run_menu_action ufw_allow_source_to_port ;;
+      13) run_menu_action ufw_limit_port ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
@@ -1313,14 +1415,14 @@ fail2ban_menu() {
     cat <<EOF
 Fail2ban 管理 [$(fail2ban_status_badge)]
 
-1) 查看服务与 SSH 防护规则状态
-2) 安装并启动 Fail2ban
-3) 配置/修改 SSH 防护参数
-4) 校验并重新加载配置
-5) 解封指定 IP
-6) 停止 Fail2ban（危险）
-7) 卸载 Fail2ban（保留配置）
-0) 返回一级菜单
+（1）查看服务与 SSH 防护规则状态
+（2）安装并启动 Fail2ban
+（3）配置/修改 SSH 防护参数
+（4）校验并重新加载配置
+（5）解封指定 IP
+（6）停止 Fail2ban（危险）
+（7）卸载 Fail2ban（保留配置）
+（0）返回一级菜单
 EOF
     printf '\n'
     read -r -p "请选择：" choice
@@ -1344,12 +1446,13 @@ menu() {
     cat <<EOF
 SUF ${APP_VERSION} - Server UFW & SSH Fortress (Debian/Ubuntu)
 
-1) SSH 与密钥管理       [$(ssh_status_badge)]
-2) UFW 防火墙管理       [$(ufw_status_badge)]
-3) Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
-4) 查看整体安全状态
-5) 一键安全加固流程
-0) 退出
+（1）SSH 与密钥管理       [$(ssh_status_badge)]
+（2）UFW 防火墙管理       [$(ufw_status_badge)]
+（3）Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
+（4）查看整体安全状态
+（5）一键安全加固流程
+（6）更新 SUF 项目
+（0）退出
 EOF
     printf '\n'
     read -r -p "请选择服务领域：" choice
@@ -1359,6 +1462,7 @@ EOF
       3) fail2ban_menu ;;
       4) run_menu_action show_status ;;
       5) run_menu_action all_in_one ;;
+      6) run_menu_action update_suf_project ;;
       0) exit 0 ;;
       *) warn "无效选项。"; pause ;;
     esac
