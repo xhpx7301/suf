@@ -27,7 +27,15 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-SOURCE="${SCRIPT_DIR}/suf"
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  source /etc/os-release
+fi
+case "${ID:-}" in
+  alpine) SOURCE="${SCRIPT_DIR}/suf-alpine" ;;
+  debian|ubuntu) SOURCE="${SCRIPT_DIR}/suf" ;;
+  *) die "不支持的操作系统：${ID:-unknown}。当前支持 Debian/Ubuntu 和 Alpine。" ;;
+esac
 
 [[ -f $SOURCE ]] || die "未找到主程序：${SOURCE}"
 bash -n "$SOURCE" || die "suf 未通过 Bash 语法校验。"

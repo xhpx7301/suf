@@ -22,10 +22,11 @@ SUF 本身不是常驻服务。它只在执行命令时运行，适合资源有�
 ## 支持范围
 
 - Debian 12/13
-- Ubuntu 22.04/24.04 及相近版本
-- systemd + OpenSSH 服务
+- Ubuntu 22.04/24.04 及相近版本（systemd + OpenSSH + UFW）
+- Alpine Linux（OpenRC + OpenSSH + nftables）
 
 脚本不会修改云厂商安全组。修改 SSH 端口前，必须先在云控制台放行新端口。
+安装程序会根据 `/etc/os-release` 自动选择 Debian/Ubuntu 或 Alpine 分支。Alpine 使用 nftables，不使用 UFW 和 systemd。
 
 ## 快捷安装
 
@@ -165,6 +166,10 @@ SUF 1.2.2 - Server UFW & SSH Fortress
 | `6` 停止 Fail2ban | 停止服务并取消开机启动，新的暴力破解不会再被自动封禁；确认输入 `y`，直接回车取消。 |
 | `7` 卸载 Fail2ban | 移除软件包但保留 `/etc/fail2ban` 配置；确认输入 `y`，直接回车取消。 |
 
+### Alpine 分支
+
+Alpine 分支的防火墙菜单使用 nftables，服务由 OpenRC 管理。Fail2ban 使用 `/var/log/messages` 文件后端；配置时如果日志文件不存在，脚本会自动启用 Alpine syslog 或安装 syslog-ng，并通过 `logger` 验证日志确实能写入后才继续。不会仅创建空文件来掩盖日志服务故障。Alpine 分支首版聚焦 SSH、公钥、端口、nftables 和 Fail2ban，UFW 专用的编号规则和来源规则界面不适用。
+
 ## 推荐操作顺序
 
 先在自己的电脑生成密钥：
@@ -214,6 +219,7 @@ sudo bash ./uninstall.sh
 /usr/local/bin/suf -> /usr/local/sbin/suf
 /etc/ssh/sshd_config.d/00-suf-hardening.conf
 /etc/fail2ban/jail.d/suf.local
+/etc/nftables.d/suf.nft（Alpine）
 /var/backups/suf/
 ```
 
