@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.0.1-alpine"
+APP_VERSION="1.2.2"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
+DEFAULT_SSH_PORT="28377"
 SSH_MAIN="/etc/ssh/sshd_config"
 SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSH_DROPIN="${SSH_DROPIN_DIR}/00-suf-hardening.conf"
@@ -13,7 +14,6 @@ FAIL2BAN_JAIL_FILE="${FAIL2BAN_JAIL_DIR}/${APP_NAME}.local"
 NFT_CONF="/etc/nftables.d/${APP_NAME}.nft"
 NFT_MAIN="/etc/nftables.nft"
 SSHD_BIN=""
-SSH_SERVICE="sshd"
 LAST_CONFIGURED_USER=""
 export LC_ALL=C
 
@@ -28,7 +28,7 @@ ok() { printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 die() { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 pause() { printf '\n'; read -r -p "按 Enter 返回菜单..." _; }
-confirm() { local prompt=$1 answer; read -r -p "${prompt} [y/N]：" answer; [[ ${answer:-n} =~ ^[Yy]$ ]]; }
+confirm() { local prompt=$1 answer; read -r -p "${prompt} [y/N，默认 N] " answer; [[ ${answer:-n} =~ ^[Yy]$ ]]; }
 
 require_root() {
   [[ $EUID -eq 0 ]] && return
@@ -86,6 +86,18 @@ prompt_port() {
   done
 }
 
+prompt_protocol() {
+  local protocol
+  while true; do
+    read -r -p "协议 tcp/udp [tcp]：" protocol
+    protocol=${protocol:-tcp}
+    case "$protocol" in
+      tcp|udp) printf '%s\n' "$protocol"; return ;;
+      *) warn "协议只能是 tcp 或 udp。" ;;
+    esac
+  done
+}
+
 ensure_admin_user() {
   local target=$1
   [[ $target =~ ^[a-z_][a-z0-9_-]*$ ]] || die "用户名格式无效。"
@@ -119,27 +131,32 @@ authorized_key_count() {
 
 install_public_key() {
   local target_user home ssh_dir auth_file public_key key_type key_body fingerprint
-  printf '\n请在用于登录服务器的电脑上生成 SSH 密钥对（不要在服务器上生成）：\n'
-  printf '  ssh-keygen -t ed25519 -a 100\n\n'
-  read -r -p "确认已生成公钥后按 Enter 继续：" _
+  printf '\n默认给 root 安装公钥，可直接获得完整管理权限；输入其他用户名则创建普通 wheel 管理员。\n'
   read -r -p "密钥登录用户名 [root]：" target_user
   target_user=${target_user:-root}
   ensure_admin_user "$target_user"
   home=$(user_home "$target_user")
   [[ -n $home && -d $home ]] || die "找不到 ${target_user} 的家目录。"
+  printf '\n请在用于登录服务器的电脑上生成 SSH 密钥对（不要在服务器上生成；私钥不要上传服务器或 GitHub）：\n'
+  printf '  ssh-keygen -t ed25519 -a 100\n\n'
+  read -r -p "确认已在登录服务器的电脑上生成公钥后按 Enter 继续：" _
   read -r -p "粘贴 id_ed25519.pub 的完整单行内容：" public_key
   validate_public_key "$public_key" || die "公钥无效；仅接受 Ed25519 公钥。"
   ssh_dir="${home}/.ssh"; auth_file="${ssh_dir}/authorized_keys"
   install -d -m 700 -o "$target_user" -g "$target_user" "$ssh_dir"
   touch "$auth_file"; chown "$target_user:$target_user" "$auth_file"; chmod 600 "$auth_file"
   read -r key_type key_body _ <<<"$public_key"
-  if ! awk -v type="$key_type" -v body="$key_body" '{for(i=1;i<NF;i++) if($i==type && $(i+1)==body) found=1} END {exit !found}' "$auth_file"; then
+  if awk -v type="$key_type" -v body="$key_body" '{for(i=1;i<NF;i++) if($i==type && $(i+1)==body) found=1} END {exit !found}' "$auth_file"; then
+    warn "该公钥已存在，未重复写入。"
+  else
     printf '%s\n' "$public_key" >>"$auth_file"
+    ok "公钥已写入 ${auth_file}。"
   fi
   fingerprint=$(printf '%s\n' "$public_key" | ssh-keygen -lf - | awk '{print $2}')
   LAST_CONFIGURED_USER=$target_user
   printf '账号：%s\n指纹：%s\n' "$target_user" "$fingerprint"
-  printf '请保持当前会话不关闭，并在第二个终端测试密钥登录。\n'
+  printf '\n请保持当前 SSH 会话不关闭，并在第二个终端测试：\n'
+  printf '  ssh -p %s %s@服务器IP\n' "$(current_ssh_port)" "$target_user"
 }
 
 require_tested_key_login() {
@@ -147,21 +164,33 @@ require_tested_key_login() {
   home=$(user_home "$target"); count=$(authorized_key_count "${home}/.ssh/authorized_keys")
   ((count > 0)) || die "账号 ${target} 没有有效的 Ed25519 公钥。"
   [[ $target == root ]] || user_is_admin "$target" || die "账号 ${target} 不在 wheel 管理组。"
-  [[ $target == root ]] && warn "请在第二个终端用 root 密钥登录并确认 whoami 输出 root。" || warn "请在第二个终端用 ${target} 密钥登录并确认 doas -n true 成功。"
-  read -r -p "确认已完成测试？[y/N]：" answer
-  [[ ${answer:-n} =~ ^[Yy]$ ]] || die "未确认测试。"
+  if [[ $target == root ]]; then
+    warn "只有在第二个终端已用 root 密钥登录，并确认 whoami 输出 root 后才能继续。"
+  else
+    warn "只有在第二个终端已用 ${target} 的密钥登录并成功执行 doas -n true 后才能继续。"
+  fi
+  read -r -p "确认已完成上述测试？[y/N，默认 N] " answer
+  [[ ${answer:-n} =~ ^[Yy]$ ]] || die "未确认测试，取消 SSH 加固。"
 }
 
 backup_ssh_config() {
   local stamp backup_dir; stamp=$(date +%Y%m%d-%H%M%S); backup_dir="${BACKUP_ROOT}/${stamp}"; mkdir -p "$backup_dir"
   cp -a "$SSH_MAIN" "${backup_dir}/sshd_config"
-  [[ -e $SSH_DROPIN ]] && cp -a "$SSH_DROPIN" "${backup_dir}/00-suf-hardening.conf" || : >"${backup_dir}/dropin-was-absent"
+  if [[ -e $SSH_DROPIN ]]; then
+    cp -a "$SSH_DROPIN" "${backup_dir}/00-suf-hardening.conf"
+  else
+    : >"${backup_dir}/dropin-was-absent"
+  fi
   printf '%s\n' "$backup_dir"
 }
 
 restore_ssh_backup() {
   local dir=$1; cp -a "${dir}/sshd_config" "$SSH_MAIN"
-  [[ -e ${dir}/dropin-was-absent ]] && rm -f "$SSH_DROPIN" || cp -a "${dir}/00-suf-hardening.conf" "$SSH_DROPIN"
+  if [[ -e ${dir}/dropin-was-absent ]]; then
+    rm -f "$SSH_DROPIN"
+  else
+    cp -a "${dir}/00-suf-hardening.conf" "$SSH_DROPIN"
+  fi
 }
 
 ensure_dropin_include_first() {
@@ -199,7 +228,7 @@ EOF
 }
 
 write_sshd_port() {
-  local port=$1 backup_dir tmp
+  local port=$1 backup_dir effective tmp
   backup_dir=$(backup_ssh_config); mkdir -p "$SSH_DROPIN_DIR"; ensure_dropin_include_first; tmp=$(mktemp)
   if [[ -e $SSH_DROPIN ]]; then
     awk -v port="$port" 'tolower($1)=="port" {if(!written++) print "Port " port; next} {print} END {if(!written) print "Port " port}' "$SSH_DROPIN" >"$tmp"
@@ -207,33 +236,147 @@ write_sshd_port() {
     printf '# Managed by SUF %s\nPort %s\n' "$APP_VERSION" "$port" >"$tmp"
   fi
   install -m 600 -o root -g root "$tmp" "$SSH_DROPIN"; rm -f "$tmp"
-  reload_ssh || { restore_ssh_backup "$backup_dir"; reload_ssh || true; die "SSH 端口修改失败，已恢复原配置。"; }
-  ok "SSH 端口已修改为 ${port}。"
+  if ! "$SSHD_BIN" -t; then
+    warn "sshd 配置校验失败，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "旧配置恢复后仍无法通过校验，请保持当前会话并人工检查 ${SSH_MAIN}。"
+    die "没有应用任何 SSH 变更。"
+  fi
+  effective=$(effective_sshd_value port)
+  if [[ $effective != "$port" ]]; then
+    warn "新的 SSH 端口未生效，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
+    die "没有应用任何 SSH 变更。"
+  fi
+  if ! reload_ssh; then
+    warn "SSH 配置重新加载失败，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    reload_ssh || die "自动恢复失败；不要关闭当前 SSH 会话。"
+    die "SSH 端口变更已撤销。"
+  fi
+  ok "SSH 端口已修改为 ${port}，认证策略未做改变。"
+  info "原 SSH 配置备份位于 ${backup_dir}。"
+  warn "不要关闭当前会话。请在新终端测试：ssh -p ${port} 用户名@服务器IP"
 }
 
-ssh_status() {
+show_ssh_status() {
+  local service_state config root_config port login_grace max_auth root_login pubkey password kbd auth_methods
+  local root_text pubkey_text password_text kbd_text auth_text summary
   if ! find_sshd; then
     printf 'SSH 服务：未安装\n'
     return
   fi
-  printf 'SSH 服务：%s\n' "$(rc-service sshd status >/dev/null 2>&1 && printf 运行中 || printf 已停止)"
-  printf 'SSH 端口：%s\n' "$(current_ssh_port)"
-  "$SSHD_BIN" -T 2>/dev/null | awk '/^(passwordauthentication|pubkeyauthentication|permitrootlogin) / {print}'
+
+  if rc-service sshd status >/dev/null 2>&1; then service_state='运行中'; else service_state='已停止或启动失败'; fi
+  config=$("$SSHD_BIN" -T 2>/dev/null) || die "无法读取 SSH 生效配置。"
+  root_config=$("$SSHD_BIN" -T -C "user=root,host=$(hostname),addr=127.0.0.1" 2>/dev/null) || root_config=$config
+  port=$(awk '$1 == "port" {print $2; exit}' <<<"$config")
+  login_grace=$(awk '$1 == "logingracetime" {print $2; exit}' <<<"$config")
+  max_auth=$(awk '$1 == "maxauthtries" {print $2; exit}' <<<"$config")
+  pubkey=$(awk '$1 == "pubkeyauthentication" {print $2; exit}' <<<"$config")
+  password=$(awk '$1 == "passwordauthentication" {print $2; exit}' <<<"$config")
+  kbd=$(awk '$1 == "kbdinteractiveauthentication" {print $2; exit}' <<<"$config")
+  auth_methods=$(awk '$1 == "authenticationmethods" {print $2; exit}' <<<"$config")
+  root_login=$(awk '$1 == "permitrootlogin" {print $2; exit}' <<<"$root_config")
+
+  case "$root_login" in
+    no) root_text='已禁止' ;;
+    prohibit-password|without-password) root_text='仅允许密钥（符合默认模式）' ;;
+    forced-commands-only) root_text='仅允许强制命令（受限）' ;;
+    yes) root_text='未限制（风险，取决于其他认证设置）' ;;
+    *) root_text=${root_login:-未知} ;;
+  esac
+  [[ $pubkey == yes ]] && pubkey_text='已启用' || pubkey_text='未启用（风险）'
+  [[ $password == no ]] && password_text='已禁止（安全）' || password_text='允许（建议关闭）'
+  [[ $kbd == no ]] && kbd_text='已禁止（安全）' || kbd_text='允许（建议关闭）'
+  case "$auth_methods" in
+    publickey) auth_text='仅允许公钥' ;;
+    any) auth_text='任意可用认证方式' ;;
+    *) auth_text=${auth_methods:-未知} ;;
+  esac
+  if [[ $service_state != 运行中 ]]; then
+    summary='SSH 服务未正常运行'
+  elif [[ ($root_login == no || $root_login == prohibit-password || $root_login == without-password) && $pubkey == yes && $password == no && $kbd == no && $auth_methods == publickey ]]; then
+    [[ $root_login == no ]] && summary='Root 登录已禁止，所有密码认证均已禁止' || summary='Root 仅可使用密钥登录，所有密码认证均已禁止'
+  else
+    summary='存在未加固项目，请检查标注为“风险”或“建议关闭”的设置'
+  fi
+
+  printf 'SSH 服务状态\n'
+  printf '  服务名称：sshd\n'
+  printf '  运行状态：%s\n' "$service_state"
+  printf '  监听端口：%s\n' "${port:-未知}"
+  printf '  登录等待时间：%s 秒\n' "${login_grace:-未知}"
+  printf '  最大认证尝试：%s 次\n' "${max_auth:-未知}"
+  printf '\nSSH 认证安全\n'
+  printf '  Root 登录策略：%s\n' "$root_text"
+  printf '  公钥认证：%s\n' "$pubkey_text"
+  printf '  密码认证：%s\n' "$password_text"
+  printf '  键盘交互认证：%s\n' "$kbd_text"
+  printf '  强制认证方式：%s\n' "$auth_text"
+  printf '\n安全判断：%s\n' "$summary"
 }
 
-install_openssh_service() { ensure_openssh; "$SSHD_BIN" -t; rc-service sshd start; ok "OpenSSH 已安装并启动。"; }
+install_openssh_service() { ensure_openssh; "$SSHD_BIN" -t; rc-service sshd start; ok "OpenSSH 服务已安装并启动。"; }
 
-configure_ssh() {
-  local target current target_port
-  ensure_openssh; read -r -p "已验证密钥登录的用户名 [root]：" target; target=${target:-root}; require_tested_key_login "$target"
-  current=$(current_ssh_port); target_port=$(prompt_port "$current" "SSH 端口")
-  confirm "启用仅密钥登录并应用 SSH 端口 ${target_port} 吗？" || die "取消 SSH 配置。"
-  write_sshd_hardening "$target_port" "$target"
+enable_key_only_login() {
+  local current_port target
+  ensure_openssh
+  current_port=$(current_ssh_port)
+  read -r -p "已验证密钥登录的用户名 [root]：" target
+  target=${target:-root}
+  require_tested_key_login "$target"
+  warn "应用后将禁止所有 SSH 密码和键盘交互认证，只保留公钥登录；当前端口 ${current_port} 不变。"
+  write_sshd_hardening "$current_port" "$target"
 }
 
-change_ssh_port() { local current target; ensure_openssh; current=$(current_ssh_port); target=$(prompt_port "$current" "SSH 端口"); [[ $target == "$current" ]] && return; write_sshd_port "$target"; }
+reload_ssh_service() {
+  ensure_openssh
+  "$SSHD_BIN" -t
+  reload_ssh
+  ok "SSH 配置校验通过并已重新加载。"
+}
 
-NFT_ACTIVE=0
+restore_latest_ssh_backup() {
+  local backup_file backup_dir
+  ensure_openssh
+  [[ -d $BACKUP_ROOT ]] || die "没有找到 SSH 配置备份。"
+  backup_file=$(find "$BACKUP_ROOT" -type f -name sshd_config 2>/dev/null | sort | tail -n 1)
+  [[ -n $backup_file ]] || die "没有找到 SSH 配置备份。"
+  backup_dir=${backup_file%/sshd_config}
+  warn "将恢复最新备份：${backup_dir}"
+  confirm "确认恢复吗？" || die "取消操作。"
+  restore_ssh_backup "$backup_dir"
+  "$SSHD_BIN" -t || die "备份配置校验失败，未重新加载 SSH。"
+  reload_ssh
+  ok "已恢复 ${backup_dir}。请保持当前会话并测试新连接。"
+}
+
+change_ssh_port() {
+  local current target
+  ensure_openssh
+  current=$(current_ssh_port)
+  target=$(prompt_port "$DEFAULT_SSH_PORT" "新的 SSH 端口")
+  [[ $target != "$current" ]] || { info "目标端口与当前端口相同，未做修改。"; return; }
+  warn "请先确认云厂商安全组已放行 TCP/${target}。"
+  confirm "已经放行或服务器没有外部安全组吗？" || die "取消操作。"
+  if command -v nft >/dev/null 2>&1 && nft_table_exists; then
+    if nft list chain inet suf input 2>/dev/null | grep -Eq "tcp dport ${target}([[:space:]]|$)"; then
+      info "nftables 已有 TCP/${target} 放行规则。"
+    else
+      nft add rule inet suf input tcp dport "$target" accept comment "SUF SSH"
+      nft list table inet suf >"$NFT_CONF"
+      nft_persistence
+      ok "nftables 已放行 TCP/${target}，原 SSH 端口规则暂时保留。"
+    fi
+  else
+    warn "未检测到正在生效的 SUF nftables 规则，脚本无法自动放行新端口。"
+    confirm "仍要继续修改 SSH 端口吗？" || die "取消操作。"
+  fi
+  write_sshd_port "$target"
+}
+
 nft_table_exists() { nft list table inet suf >/dev/null 2>&1; }
 nft_persistence() {
   install -d -m 755 /etc/nftables.d
@@ -277,7 +420,120 @@ disable_nftables_service() { require_nftables; confirm "确认关闭 nftables �
 uninstall_nftables_service() { require_nftables; confirm "确认卸载 nftables 并保留配置吗？" || die "取消卸载。"; nft delete table inet suf 2>/dev/null || true; nft_disable_persistence; rc-service nftables stop >/dev/null 2>&1 || true; apk del nftables; ok "nftables 已卸载。"; }
 show_nftables_status() { if ! command -v nft >/dev/null 2>&1; then printf 'nftables：未安装\n'; elif nft_table_exists; then printf 'nftables：SUF 规则运行中\n'; nft list table inet suf; else printf 'nftables：未启用 SUF 规则\n'; fi; }
 reload_nftables() { require_nftables; [[ -f $NFT_CONF ]] || die "未找到 SUF nftables 配置。"; nft delete table inet suf 2>/dev/null || true; nft -f "$NFT_CONF"; ok "nftables 规则已重新加载。"; }
-allow_nft_port() { local port protocol; require_nftables; nft_table_exists || die "请先启用 nftables。"; port=$(prompt_port 443 "要放行的端口"); read -r -p "协议 [tcp]：" protocol; protocol=${protocol:-tcp}; [[ $protocol == tcp || $protocol == udp ]] || die "协议只能是 tcp 或 udp。"; nft add rule inet suf input "$protocol" dport "$port" accept comment "SUF extra"; nft list table inet suf >"$NFT_CONF"; nft_persistence; ok "已放行 ${port}/${protocol}。"; }
+allow_nft_port_value() {
+  local port=$1 protocol=$2 comment=${3:-SUF extra}
+  require_nftables
+  nft_table_exists || die "SUF nftables 规则尚未启用，请先选择启用 nftables。"
+  if nft list chain inet suf input 2>/dev/null | grep -Eq "${protocol} dport ${port}([[:space:]]|$)"; then
+    warn "已存在 ${port}/${protocol} 的放行规则，未重复添加。"
+    return
+  fi
+  nft add rule inet suf input "$protocol" dport "$port" accept comment "$comment"
+  nft list table inet suf >"$NFT_CONF"
+  nft_persistence
+  ok "已放行 ${port}/${protocol}。"
+}
+
+allow_nft_port() {
+  local port protocol
+  port=$(prompt_port 443 "要放行的端口")
+  protocol=$(prompt_protocol)
+  allow_nft_port_value "$port" "$protocol"
+}
+
+public_listening_candidates() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -lntu 2>/dev/null | awk '
+      $1 ~ /^(tcp|udp)$/ {
+        local_address = $5
+        port = local_address
+        sub(/^.*:/, "", port)
+        host = local_address
+        sub(/:[^:]*$/, "", host)
+        gsub(/^\[/, "", host)
+        gsub(/\]$/, "", host)
+        if (host !~ /^127\./ && host != "::1") {
+          printf "%s %s %s\n", $1, port, host
+        }
+      }
+    ' | sort -u
+  else
+    netstat -lntu 2>/dev/null | awk '
+      $1 ~ /^(tcp|udp)/ {
+        protocol = $1
+        sub(/[0-9]+$/, "", protocol)
+        local_address = $4
+        port = local_address
+        sub(/^.*:/, "", port)
+        host = local_address
+        sub(/:[^:]*$/, "", host)
+        gsub(/^\[/, "", host)
+        gsub(/\]$/, "", host)
+        if (host !~ /^127\./ && host != "::1") {
+          printf "%s %s %s\n", protocol, port, host
+        }
+      }
+    ' | sort -u
+  fi
+}
+
+is_public_listening_port() {
+  local port=$1 protocol=$2
+  public_listening_candidates | awk -v wanted_port="$port" -v wanted_protocol="$protocol" '
+    $1 == wanted_protocol && $2 == wanted_port { found = 1 }
+    END { exit !found }
+  '
+}
+
+show_listening_ports() {
+  local offer_allow=${1:-yes} candidates port protocol
+  command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1 || die "未找到 ss 或 netstat，无法查询监听端口。"
+  printf '以下是实际监听的服务与端口，不代表已被 nftables 放行：\n\n'
+  candidates=$(public_listening_candidates || true)
+  if [[ -n $candidates ]]; then
+    printf '可考虑对公网放行的监听端口（协议 / 端口 / 绑定地址）：\n'
+    awk '{ printf "  %-4s %-7s %s\n", $1, $2, $3 }' <<<"$candidates"
+    printf '\n'
+  else
+    printf '没有检测到对公网或指定网卡监听的端口。\n\n'
+  fi
+  printf '完整监听详情（最后一列为进程/服务）：\n'
+  if command -v ss >/dev/null 2>&1; then ss -lntup; else netstat -lntup; fi
+
+  [[ $offer_allow == yes ]] || return
+  if ! command -v nft >/dev/null 2>&1 || ! nft_table_exists; then
+    info "启用 SUF nftables 规则后，可从此处选择监听端口加入放行规则。"
+    return
+  fi
+  [[ -n $candidates ]] || return
+  confirm "要从上述公网监听端口中选择一个加入 nftables 放行规则吗？" || return
+  read -r -p "输入要放行的端口号：" port
+  valid_port "$port" || die "端口必须是 1 到 65535 的整数。"
+  port=$((10#$port))
+  protocol=$(prompt_protocol)
+  is_public_listening_port "$port" "$protocol" || die "未检测到 ${port}/${protocol} 的公网监听；仅本机监听的服务不能通过此菜单开放。"
+  allow_nft_port_value "$port" "$protocol" "SUF listening service"
+}
+
+show_running_services() {
+  local init_script service found=0
+  printf 'OpenRC 正在运行的服务：\n'
+  for init_script in /etc/init.d/*; do
+    [[ -x $init_script ]] || continue
+    service=${init_script##*/}
+    if rc-service "$service" status >/dev/null 2>&1; then
+      printf '  %s\n' "$service"
+      found=1
+    fi
+  done
+  ((found)) || printf '  没有检测到正在运行的 OpenRC 服务。\n'
+}
+
+show_runtime_status() {
+  show_running_services
+  printf '\n'
+  show_listening_ports no
+}
 
 ensure_alpine_syslog() {
   local service="" probe="SUF-syslog-probe-$$"
@@ -323,25 +579,35 @@ findtime = 10m
 bantime = 1h
 EOF
   chmod 600 "$jail_file"; chown root:root "$jail_file"
-  if ! fail2ban-client -t; then [[ -n $backup ]] && cp -a "$backup" "$jail_file" || rm -f "$jail_file"; die "Fail2ban 配置校验失败，已恢复原配置。"; fi
+  if ! fail2ban-client -t; then
+    if [[ -n $backup ]]; then cp -a "$backup" "$jail_file"; else rm -f "$jail_file"; fi
+    die "Fail2ban 配置校验失败，已恢复原配置。"
+  fi
   rc-update add fail2ban default >/dev/null 2>&1 || true
   if ! rc-service fail2ban restart >/dev/null 2>&1; then
-    [[ -n $backup ]] && cp -a "$backup" "$jail_file" || rm -f "$jail_file"
+    if [[ -n $backup ]]; then cp -a "$backup" "$jail_file"; else rm -f "$jail_file"; fi
     rc-service fail2ban restart >/dev/null 2>&1 || true
     die "Fail2ban 启动失败，已恢复原配置。"
   fi
-  sleep 1; if ! rc-service fail2ban status >/dev/null 2>&1; then [[ -n $backup ]] && cp -a "$backup" "$jail_file" || rm -f "$jail_file"; rc-service fail2ban restart >/dev/null 2>&1 || true; die "Fail2ban 启动后退出，已恢复原配置。"; fi
+  sleep 1
+  if ! rc-service fail2ban status >/dev/null 2>&1; then
+    if [[ -n $backup ]]; then cp -a "$backup" "$jail_file"; else rm -f "$jail_file"; fi
+    rc-service fail2ban restart >/dev/null 2>&1 || true
+    die "Fail2ban 启动后退出，已恢复原配置。"
+  fi
   ok "Fail2ban SSH 防护已启用。"
 }
 
 fail2ban_status() { if ! command -v fail2ban-client >/dev/null 2>&1; then printf 'Fail2ban：未安装\n'; elif rc-service fail2ban status >/dev/null 2>&1; then printf 'Fail2ban：运行中\n'; fail2ban-client status sshd 2>/dev/null || true; else printf 'Fail2ban：已停止或启动失败\n'; fi; }
 configure_current_fail2ban() { ensure_openssh; configure_fail2ban "$(current_ssh_port)"; }
 install_fail2ban() { apk_install fail2ban; rc-update add fail2ban default >/dev/null 2>&1 || true; rc-service fail2ban start; ok "Fail2ban 已安装。请使用配置选项启用 SSH jail。"; }
-stop_fail2ban() { command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; confirm "确认停止 Fail2ban 吗？" || die "取消停止。"; rc-service fail2ban stop; ok "Fail2ban 已停止。"; }
+reload_fail2ban() { command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; fail2ban-client -t; rc-service fail2ban restart; ok "Fail2ban 配置已校验并重新加载。"; }
+unban_fail2ban_ip() { local address; command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; read -r -p "要解封的 IPv4/IPv6 地址：" address; [[ $address =~ ^[0-9A-Fa-f:.]+$ ]] || die "IP 地址格式无效。"; fail2ban-client set sshd unbanip "$address"; ok "已提交解封：${address}。"; }
+stop_fail2ban() { command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; warn "停止 Fail2ban 后将不再自动封禁新的攻击来源。"; confirm "确认停止 Fail2ban 吗？" || die "取消停止。"; rc-service fail2ban stop; rc-update del fail2ban default >/dev/null 2>&1 || true; ok "Fail2ban 已停止并取消开机启动。"; }
 uninstall_fail2ban() { command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; confirm "确认卸载 Fail2ban 并保留配置吗？" || die "取消卸载。"; rc-service fail2ban stop >/dev/null 2>&1 || true; apk del fail2ban; ok "Fail2ban 已卸载。"; }
 
 security_initialization_wizard() {
-  local target current port
+  local target port
   cat <<'EOF'
 安全初始化向导将执行：
   1. 安装公钥并验证密钥登录
@@ -352,8 +618,11 @@ security_initialization_wizard() {
 仅建议用于新服务器或已确认全部公网服务端口的服务器。
 EOF
   confirm "确认执行安全初始化向导吗？" || die "取消安全初始化。"
-  ensure_openssh; install_public_key; target=$LAST_CONFIGURED_USER; require_tested_key_login "$target"; current=$(current_ssh_port); port=$(prompt_port "$current" "SSH 端口")
+  ensure_openssh; install_public_key; target=$LAST_CONFIGURED_USER; require_tested_key_login "$target"; port=$(prompt_port "$DEFAULT_SSH_PORT" "新的 SSH 端口")
   confirm "确认云安全组已放行 TCP/${port} 吗？" || die "取消初始化。"
+  show_listening_ports no
+  warn "即将启用入站默认拒绝；除 SSH ${port}/tcp 外，其他公网服务端口需稍后手动放行。"
+  confirm "确认继续启用 nftables 吗？" || die "取消初始化。"
   install_nftables_service; nft_write_base "$port"; rc-service nftables start >/dev/null 2>&1 || true
   write_sshd_hardening "$port" "$target"; configure_fail2ban "$port"; ok "Alpine 安全初始化完成。"
 }
@@ -361,70 +630,185 @@ EOF
 project_dir() { [[ -n ${SUF_HOME:-} ]] && printf '%s\n' "$SUF_HOME" || printf '%s/suf\n' "$HOME"; }
 update_project() { local dir; apk_install git; dir=$(project_dir); [[ ! -L $dir ]] || die "${dir} 是符号链接，拒绝更新。"; if [[ -d ${dir}/.git ]]; then [[ $(git -C "$dir" remote get-url origin 2>/dev/null || true) == "${APP_REPOSITORY}.git" ]] || die "远程仓库不是 SUF。"; [[ -z $(git -C "$dir" status --porcelain) ]] || die "仓库存在未提交修改。"; git -C "$dir" pull --ff-only; elif [[ -e $dir ]]; then die "${dir} 不是 SUF Git 仓库。"; else git clone --depth 1 "${APP_REPOSITORY}.git" "$dir"; fi; [[ -f ${dir}/install.sh ]] || die "仓库中缺少 install.sh。"; bash "${dir}/install.sh" --no-launch; ok "SUF Alpine 已更新。"; }
 
-run_menu_action() { local status; set +e; (set -Eeuo pipefail; "$@"); status=$?; set -e; ((status == 0)) || warn "操作未完成（退出码 ${status}）。"; pause; }
+run_menu_action() { local status; set +e; (set -Eeuo pipefail; "$@"); status=$?; set -e; ((status == 0)) || warn "操作未完成（退出码 ${status}）。请检查上方提示。"; pause; }
 
-ssh_menu() { while true; do clear 2>/dev/null || true; cat <<EOF
-SSH 与密钥管理
+ssh_status_badge() {
+  if ! command -v sshd >/dev/null 2>&1; then
+    printf '未安装'
+  elif rc-service sshd status >/dev/null 2>&1; then
+    printf '运行中'
+  else
+    printf '已停止'
+  fi
+}
 
-（1）查看 SSH 状态
-（2）安装/修复 OpenSSH
-（3）安装公钥并验证
-（4）启用仅密钥登录或修改端口
-（5）修改 SSH 端口
-（0）返回
+nftables_status_badge() {
+  if ! command -v nft >/dev/null 2>&1; then
+    printf '未安装'
+  elif nft_table_exists; then
+    printf '运行中'
+  else
+    printf '已关闭'
+  fi
+}
+
+fail2ban_status_badge() {
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    printf '未安装'
+  elif rc-service fail2ban status >/dev/null 2>&1; then
+    printf '运行中'
+  else
+    printf '已停止'
+  fi
+}
+
+ensure_openssh_and_key() {
+  ensure_openssh
+  install_public_key
+}
+
+ssh_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+SSH 与密钥管理 [$(ssh_status_badge)]
+
+（1）查看 SSH 状态与安全配置
+（2）安装/修复 OpenSSH 服务
+（3）为登录用户安装公钥（默认 root）
+（4）启用仅密钥登录
+（5）修改 SSH 端口（默认 ${DEFAULT_SSH_PORT}）
+（6）校验并重新加载 SSH
+（7）恢复最近一次 SSH 配置备份
+（0）返回一级菜单
 EOF
-read -r -p "请选择：" choice; case ${choice:-} in 1) run_menu_action ssh_status;; 2) run_menu_action install_openssh_service;; 3) run_menu_action install_public_key;; 4) run_menu_action configure_ssh;; 5) run_menu_action change_ssh_port;; 0) return;; *) warn "无效选项。"; pause;; esac; done; }
+    printf '\n'
+    read -r -p "请选择：" choice
+    case ${choice:-} in
+      1) run_menu_action show_ssh_status ;;
+      2) run_menu_action install_openssh_service ;;
+      3) run_menu_action ensure_openssh_and_key ;;
+      4) run_menu_action enable_key_only_login ;;
+      5) run_menu_action change_ssh_port ;;
+      6) run_menu_action reload_ssh_service ;;
+      7) run_menu_action restore_latest_ssh_backup ;;
+      0) return ;;
+      *) warn "无效选项。"; pause ;;
+    esac
+  done
+}
 
-firewall_menu() { while true; do clear 2>/dev/null || true; cat <<EOF
-nftables 防火墙管理
+firewall_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+nftables 防火墙管理 [$(nftables_status_badge)]
 
-（1）查看状态
+（1）查看状态与生效规则
 （2）安装 nftables
-（3）启用 nftables
-（4）关闭 SUF 防火墙规则
-（5）卸载 nftables
+（3）启用 SUF nftables 规则
+（4）关闭 SUF nftables 规则
+（5）卸载 nftables（保留配置）
 （6）重新加载规则
 （7）放行指定端口
-（0）返回
+（8）查看实际监听服务与端口并按需放行
+（0）返回一级菜单
 EOF
-read -r -p "请选择：" choice; case ${choice:-} in 1) run_menu_action show_nftables_status;; 2) run_menu_action install_nftables_service;; 3) run_menu_action enable_nftables_service;; 4) run_menu_action disable_nftables_service;; 5) run_menu_action uninstall_nftables_service;; 6) run_menu_action reload_nftables;; 7) run_menu_action allow_nft_port;; 0) return;; *) warn "无效选项。"; pause;; esac; done; }
+    printf '\n'
+    read -r -p "请选择：" choice
+    case ${choice:-} in
+      1) run_menu_action show_nftables_status ;;
+      2) run_menu_action install_nftables_service ;;
+      3) run_menu_action enable_nftables_service ;;
+      4) run_menu_action disable_nftables_service ;;
+      5) run_menu_action uninstall_nftables_service ;;
+      6) run_menu_action reload_nftables ;;
+      7) run_menu_action allow_nft_port ;;
+      8) run_menu_action show_listening_ports ;;
+      0) return ;;
+      *) warn "无效选项。"; pause ;;
+    esac
+  done
+}
 
-fail2ban_menu() { while true; do clear 2>/dev/null || true; cat <<EOF
-Fail2ban 管理
+fail2ban_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+Fail2ban 管理 [$(fail2ban_status_badge)]
 
-（1）查看 SSH 防护状态
-（2）安装 Fail2ban
-（3）配置 SSH 防护
-（4）停止 Fail2ban
-（5）卸载 Fail2ban
-（0）返回
+（1）查看服务与 SSH 防护规则状态
+（2）安装并启动 Fail2ban
+（3）配置/修改 SSH 防护参数
+（4）校验并重新加载配置
+（5）解封指定 IP
+（6）停止 Fail2ban
+（7）卸载 Fail2ban（保留配置）
+（0）返回一级菜单
 EOF
-read -r -p "请选择：" choice; case ${choice:-} in 1) run_menu_action fail2ban_status;; 2) run_menu_action install_fail2ban;; 3) run_menu_action configure_current_fail2ban;; 4) run_menu_action stop_fail2ban;; 5) run_menu_action uninstall_fail2ban;; 0) return;; *) warn "无效选项。"; pause;; esac; done; }
+    printf '\n'
+    read -r -p "请选择：" choice
+    case ${choice:-} in
+      1) run_menu_action fail2ban_status ;;
+      2) run_menu_action install_fail2ban ;;
+      3) run_menu_action configure_current_fail2ban ;;
+      4) run_menu_action reload_fail2ban ;;
+      5) run_menu_action unban_fail2ban_ip ;;
+      6) run_menu_action stop_fail2ban ;;
+      7) run_menu_action uninstall_fail2ban ;;
+      0) return ;;
+      *) warn "无效选项。"; pause ;;
+    esac
+  done
+}
 
-show_status() { printf '\n系统：Alpine Linux\n'; ssh_status; printf '\n'; show_nftables_status; printf '\n'; fail2ban_status; }
+show_status() { printf '\n系统：Alpine Linux\n\n'; show_ssh_status; printf '\n\nnftables：\n'; show_nftables_status; printf '\nFail2ban：\n'; fail2ban_status; }
 
-menu() { while true; do clear 2>/dev/null || true; cat <<EOF
-SUF ${APP_VERSION} - Alpine Server Security
+menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<EOF
+SUF ${APP_VERSION} - Alpine 服务器安全管理
 
-（1）SSH 与密钥管理
-（2）nftables 防火墙管理
-（3）Fail2ban 防暴力破解
+（1）SSH 与密钥管理       [$(ssh_status_badge)]
+（2）nftables 防火墙管理  [$(nftables_status_badge)]
+（3）Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
 （4）查看整体安全状态
 （5）安全初始化向导
 （6）更新 SUF 项目
+（7）查看运行服务与监听端口
 （0）退出
 EOF
-read -r -p "请选择：" choice; case ${choice:-} in 1) ssh_menu;; 2) firewall_menu;; 3) fail2ban_menu;; 4) run_menu_action show_status;; 5) run_menu_action security_initialization_wizard;; 6) run_menu_action update_project;; 0) exit 0;; *) warn "无效选项。"; pause;; esac; done; }
+    printf '\n'
+    read -r -p "请选择服务领域：" choice
+    case ${choice:-} in
+      1) ssh_menu ;;
+      2) firewall_menu ;;
+      3) fail2ban_menu ;;
+      4) run_menu_action show_status ;;
+      5) run_menu_action security_initialization_wizard ;;
+      6) run_menu_action update_project ;;
+      7) run_menu_action show_runtime_status ;;
+      0) exit 0 ;;
+      *) warn "无效选项。"; pause ;;
+    esac
+  done
+}
 
 usage() { cat <<EOF
-SUF ${APP_VERSION} - Alpine Server Security
+SUF ${APP_VERSION} - Alpine 服务器安全管理
 
 用法：
-  suf              打开 Alpine 安全管理菜单
-  suf status       查看 SSH、nftables、Fail2ban 状态
-  suf --version    显示版本
+  suf               打开 Alpine 安全管理菜单
+  suf menu          打开 Alpine 安全管理菜单
+  suf status        查看 SSH、nftables、Fail2ban 状态
+  suf services      查看运行中的 OpenRC 服务和监听端口
+  suf --version     显示版本
+  suf --help        显示帮助
+
+项目：${APP_REPOSITORY}
 EOF
 }
 
-main() { case ${1:-menu} in -V|--version|version) printf 'suf %s\n' "$APP_VERSION";; -h|--help|help) usage;; menu|"") require_root "$@"; load_os; menu;; status) require_root "$@"; load_os; show_status;; *) usage >&2; exit 2;; esac; }
+main() { case ${1:-menu} in -V|--version|version) printf 'suf %s\n' "$APP_VERSION";; -h|--help|help) usage;; menu|"") require_root "$@"; load_os; menu;; status) require_root "$@"; load_os; show_status;; services) require_root "$@"; load_os; show_runtime_status;; *) usage >&2; exit 2;; esac; }
 [[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"

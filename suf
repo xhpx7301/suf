@@ -4,6 +4,7 @@ set -Eeuo pipefail
 APP_VERSION="1.2.2"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
+DEFAULT_SSH_PORT="28377"
 SSH_MAIN="/etc/ssh/sshd_config"
 SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSH_DROPIN="${SSH_DROPIN_DIR}/00-suf-hardening.conf"
@@ -531,7 +532,7 @@ change_ssh_port() {
   local current_port target_port
   ensure_openssh
   current_port=$(current_ssh_port)
-  target_port=$(prompt_port "$current_port" "SSH 端口")
+  target_port=$(prompt_port "$DEFAULT_SSH_PORT" "新的 SSH 端口")
   [[ $target_port != "$current_port" ]] || {
     info "目标端口与当前端口相同，未做修改。"
     return
@@ -1312,7 +1313,7 @@ security_initialization_wizard() {
   require_tested_key_login "$target_user"
 
   current_port=$(current_ssh_port)
-  target_port=$(prompt_port "$current_port" "SSH 端口")
+  target_port=$(prompt_port "$DEFAULT_SSH_PORT" "新的 SSH 端口")
   warn "请先在云安全组放行 TCP/${target_port}，当前 SSH 会话不要关闭。"
   confirm "已经放行或服务器没有外部安全组吗？" || die "未确认云防火墙，取消操作。"
 
@@ -1368,7 +1369,7 @@ SSH 与密钥管理 [$(ssh_status_badge)]
 （2）安装/修复 OpenSSH 服务
 （3）为登录用户安装公钥（默认 root）
 （4）启用仅密钥登录
-（5）修改 SSH 端口
+（5）修改 SSH 端口（默认 ${DEFAULT_SSH_PORT}）
 （6）校验并重新加载 SSH
 （7）恢复最近一次 SSH 配置备份
 （0）返回一级菜单

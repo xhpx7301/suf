@@ -132,7 +132,7 @@ SUF 1.2.2 - Server UFW & SSH Fortress
 | `2` 安装/修复 OpenSSH 服务 | 安装并启动 OpenSSH；不会移除现有 SSH 配置。 |
 | `3` 为登录用户安装公钥 | 先在用于登录服务器的电脑上执行 `ssh-keygen -t ed25519 -a 100`，不要在服务器上生成；确认后再粘贴 `id_ed25519.pub` 公钥。默认写入 `/root/.ssh/authorized_keys`；绝不能上传私钥。 |
 | `4` 启用仅密钥登录 | 禁用 SSH 密码和键盘交互认证，保留当前端口。必须先在第二个终端验证密钥登录；确认输入 `y`，直接回车视为否。 |
-| `5` 修改 SSH 端口 | 仅修改 SSH 端口，不改变密码或密钥认证策略。必须先在云安全组放行新端口，SUF 会放行对应 UFW 规则。 |
+| `5` 修改 SSH 端口 | 仅修改 SSH 端口，不改变密码或密钥认证策略。新端口默认值为 `28377`，直接按 Enter 即采用该端口。必须先在云安全组放行新端口，SUF 会放行对应 UFW 规则。 |
 | `6` 校验并重新加载 SSH | 对配置执行语法校验后重载 SSH。适合手动修改 SSH 配置后使用。 |
 | `7` 恢复最近一次 SSH 配置备份 | 还原 SUF 保存的最新 SSH 配置。恢复后仍应保持当前会话并测试新连接。 |
 
@@ -168,7 +168,11 @@ SUF 1.2.2 - Server UFW & SSH Fortress
 
 ### Alpine 分支
 
-Alpine 分支的防火墙菜单使用 nftables，服务由 OpenRC 管理。Fail2ban 使用 `/var/log/messages` 文件后端；配置时如果日志文件不存在，脚本会自动启用 Alpine syslog 或安装 syslog-ng，并通过 `logger` 验证日志确实能写入后才继续。不会仅创建空文件来掩盖日志服务故障。Alpine 分支首版聚焦 SSH、公钥、端口、nftables 和 Fail2ban，UFW 专用的编号规则和来源规则界面不适用。
+Alpine 分支的 SSH 菜单与 Debian/Ubuntu 保持相同的职责划分：安装公钥、启用仅密钥登录和修改 SSH 端口是三个独立操作；修改端口的默认值同样为 `28377`，直接按 Enter 即采用。修改端口时会先要求确认云安全组；如果 SUF nftables 规则正在运行，还会先放行新端口并暂时保留旧端口规则。
+
+Alpine 主菜单会显示 SSH、nftables 和 Fail2ban 的实时状态。选择“查看运行服务与监听端口”或执行 `suf services`，可以列出正在运行的 OpenRC 服务以及监听进程、协议、地址和端口。nftables 菜单还可以从公网监听端口中选择一个加入放行规则。
+
+Alpine 使用 nftables 和 OpenRC。Fail2ban 使用 `/var/log/messages` 文件后端；配置时如果日志文件不存在，脚本会自动启用 Alpine syslog 或安装 syslog-ng，并通过 `logger` 验证日志确实能写入后才继续。UFW 专用的编号规则和来源规则界面不适用。
 
 ## 推荐操作顺序
 
@@ -185,7 +189,7 @@ ssh-keygen -t ed25519 -a 100
 3. 进入 UFW 菜单，安装后启用 UFW；SUF 会为当前 SSH 连接保留管理入口。
 4. 确认云安全组已放行目标 SSH 端口。
 5. 返回 SSH 菜单，启用 root 仅密钥登录并禁止所有密码认证；该操作保留当前端口。
-6. 如需更换端口，再单独选择“修改 SSH 端口”。
+6. 如需更换端口，再单独选择“修改 SSH 端口”；默认新端口为 `28377`，直接按 Enter 即采用。
 7. 保持原会话，在第三个终端测试新的 SSH 连接。
 8. 进入 Fail2ban 菜单，安装并配置 SSH 防护规则。
 9. 新连接确认正常后，删除不需要的旧 UFW SSH 规则。
