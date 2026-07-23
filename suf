@@ -40,8 +40,17 @@ pause() {
 
 confirm() {
   local prompt=$1 answer
-  read -r -p "${prompt} [y/N，默认 N] " answer
-  [[ ${answer:-n} =~ ^[Yy]$ ]]
+  while true; do
+    if ! read -r -p "${prompt} [y/N，默认 N] " answer; then
+      printf '\n' >&2
+      return 1
+    fi
+    case "$answer" in
+      [Yy]) return 0 ;;
+      ""|[Nn]) return 1 ;;
+      *) warn "请输入 y 或 n；直接按 Enter 默认为 n。" ;;
+    esac
+  done
 }
 
 require_root() {
@@ -265,9 +274,10 @@ install_public_key() {
   home=$(user_home "$target_user")
   [[ -n $home && -d $home ]] || die "找不到 ${target_user} 的家目录。"
 
-  printf '\n请在用于登录服务器的电脑上生成 SSH 密钥对（不要在服务器上生成；私钥不要上传服务器或 GitHub）：\n'
-  printf '  ssh-keygen -t ed25519 -a 100\n\n'
-  read -r -p "确认已在登录服务器的电脑上生成公钥后按 Enter 继续：" _
+  printf '\n请准备登录设备上的 Ed25519 公钥；可使用已有公钥，也可在登录设备上生成新密钥对：\n'
+  printf '  ssh-keygen -t ed25519 -a 100\n'
+  printf '不要在服务器上生成登录密钥，私钥不要上传服务器或 GitHub。\n\n'
+  read -r -p "准备好公钥后按 Enter 继续：" _
   read -r -p "粘贴 id_ed25519.pub 的完整单行内容：" public_key
   validate_public_key "$public_key" || die "公钥无效；仅接受 Ed25519 公钥。"
 
@@ -367,7 +377,7 @@ authorized_key_count() {
 }
 
 require_tested_key_login() {
-  local target_user=$1 confirmation count
+  local target_user=$1 count
   id "$target_user" >/dev/null 2>&1 || die "账号 ${target_user} 不存在。"
   if [[ $target_user != root ]]; then
     user_has_sudo "$target_user" || die "账号 ${target_user} 没有 sudo 权限。"
@@ -380,8 +390,7 @@ require_tested_key_login() {
   else
     warn "只有在第二个终端已用 ${target_user} 的密钥登录并成功执行 sudo -v 后才能继续。"
   fi
-  read -r -p "确认已完成测试？[y/N]：" confirmation
-  [[ ${confirmation:-n} =~ ^[Yy]$ ]] || die "未确认测试，取消 SSH 加固。"
+  confirm "确认已完成上述测试吗？" || die "未确认测试，取消 SSH 加固。"
 }
 
 write_sshd_hardening() {
@@ -842,7 +851,7 @@ ufw_is_active() {
 }
 
 enable_ufw_service() {
-  local ssh_port source_ip confirmation
+  local ssh_port source_ip
   require_ufw
   if ufw_is_active; then
     ok "UFW 已经处于启用状态。"
@@ -866,8 +875,7 @@ enable_ufw_service() {
   warn "UFW 启用后，未明确放行的入站端口将被阻止。"
   warn "云安全组不受 UFW 控制；Docker 发布端口也需要单独审核。"
   ufw show added || true
-  read -r -p "确认规则完整请输入 ENABLE-UFW：" confirmation
-  [[ $confirmation == ENABLE-UFW ]] || die "未启用 UFW。"
+  confirm "确认以上规则完整，可以启用 UFW 吗？" || die "未启用 UFW。"
   ufw --force enable
   show_ufw_status
 }

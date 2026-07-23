@@ -9,6 +9,21 @@ die() {
   exit 1
 }
 
+confirm() {
+  local prompt=$1 answer
+  while true; do
+    if ! read -r -p "${prompt} [y/N，默认 N] " answer; then
+      printf '\n' >&2
+      return 1
+    fi
+    case "$answer" in
+      [Yy]) return 0 ;;
+      ""|[Nn]) return 1 ;;
+      *) printf '[WARN] 请输入 y 或 n；直接按 Enter 默认为 n。\n' ;;
+    esac
+  done
+}
+
 if [[ $EUID -ne 0 ]]; then
   command -v sudo >/dev/null 2>&1 || die "需要 root 权限，但系统未安装 sudo。"
   exec sudo -- bash "$0" "$@"
@@ -16,8 +31,7 @@ fi
 
 printf '[WARN] 这只会卸载 SUF 命令。\n'
 printf '[WARN] 不会撤销 SSH/UFW/Fail2ban 配置，也不会删除 /var/backups/suf。\n'
-read -r -p '确认卸载请输入 UNINSTALL-SUF：' confirmation
-[[ $confirmation == UNINSTALL-SUF ]] || die "取消卸载。"
+confirm "确认卸载 SUF 命令吗？" || die "取消卸载。"
 
 if [[ -L $LINK ]]; then
   link_target=$(readlink "$LINK")
