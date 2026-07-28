@@ -89,6 +89,7 @@ effective_sshd_value() {
   # Consume all sshd output: exiting awk early can make sshd receive SIGPIPE.
   "$SSHD_BIN" -T 2>/dev/null | awk -v wanted="$1" '$1 == wanted && !found { print $2; found=1 }'
 }
+effective_sshd_values() { "$SSHD_BIN" -T 2>/dev/null | awk -v wanted="$1" '$1 == wanted { print $2 }'; }
 current_ssh_port() { local port; port=$(effective_sshd_value port || true); printf '%s\n' "${port:-22}"; }
 valid_port() { [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 
@@ -197,12 +198,22 @@ backup_ssh_config() {
   else
     : >"${backup_dir}/dropin-was-absent"
   fi
+  if [[ -d $SSH_DROPIN_DIR ]]; then
+    cp -a "$SSH_DROPIN_DIR" "${backup_dir}/sshd_config.d"
+  else
+    : >"${backup_dir}/dropin-dir-was-absent"
+  fi
   printf '%s\n' "$backup_dir"
 }
 
 restore_ssh_backup() {
   local dir=$1; cp -a "${dir}/sshd_config" "$SSH_MAIN"
-  if [[ -e ${dir}/dropin-was-absent ]]; then
+  if [[ -e ${dir}/dropin-dir-was-absent ]]; then
+    rm -rf "$SSH_DROPIN_DIR"
+  elif [[ -d ${dir}/sshd_config.d ]]; then
+    rm -rf "$SSH_DROPIN_DIR"
+    cp -a "${dir}/sshd_config.d" "$SSH_DROPIN_DIR"
+  elif [[ -e ${dir}/dropin-was-absent ]]; then
     rm -f "$SSH_DROPIN"
   else
     cp -a "${dir}/00-suf-hardening.conf" "$SSH_DROPIN"
@@ -214,6 +225,34 @@ ensure_dropin_include_first() {
   head -n 4 "$SSH_MAIN" | grep -q '^# BEGIN SUF managed include$' && return
   tmp=$(mktemp); { printf '# BEGIN SUF managed include\nInclude %s\n# END SUF managed include\n' "$SSH_DROPIN"; cat "$SSH_MAIN"; } >"$tmp"
   install -m 600 -o root -g root "$tmp" "$SSH_MAIN"; rm -f "$tmp"
+}
+
+active_foreign_ssh_port_directives() {
+  local file
+  while IFS= read -r -d '' file; do
+    [[ $file == "$SSH_DROPIN" ]] && continue
+    awk -v file="$file" '/^[[:space:]]*[Pp][Oo][Rr][Tt][[:space:]]+/ { printf "%s:%d:%s\\n", file, NR, $0 }' "$file"
+  done < <(
+    printf '%s\0' "$SSH_MAIN"
+    if [[ -d $SSH_DROPIN_DIR ]]; then
+      find "$SSH_DROPIN_DIR" -maxdepth 1 -type f -name '*.conf' -print0
+    fi
+  )
+}
+
+disable_foreign_ssh_port_directives() {
+  local file
+  while IFS= read -r -d '' file; do
+    [[ $file == "$SSH_DROPIN" ]] && continue
+    if grep -qE '^[[:space:]]*[Pp][Oo][Rr][Tt][[:space:]]+' "$file"; then
+      sed -i -E 's/^[[:space:]]*([Pp][Oo][Rr][Tt][[:space:]]+)/# Disabled by SUF when setting SSH port: &/' "$file"
+    fi
+  done < <(
+    printf '%s\0' "$SSH_MAIN"
+    if [[ -d $SSH_DROPIN_DIR ]]; then
+      find "$SSH_DROPIN_DIR" -maxdepth 1 -type f -name '*.conf' -print0
+    fi
+  )
 }
 
 reload_ssh() { "$SSHD_BIN" -t || return 1; rc-service sshd reload >/dev/null 2>&1 || rc-service sshd restart; }
@@ -244,7 +283,7 @@ EOF
 }
 
 write_sshd_port() {
-  local port=$1 backup_dir effective tmp
+  local port=$1 backup_dir effective_ports tmp
   backup_dir=$(backup_ssh_config); mkdir -p "$SSH_DROPIN_DIR"; ensure_dropin_include_first; tmp=$(mktemp)
   if [[ -e $SSH_DROPIN ]]; then
     awk -v port="$port" 'tolower($1)=="port" {if(!written++) print "Port " port; next} {print} END {if(!written) print "Port " port}' "$SSH_DROPIN" >"$tmp"
@@ -252,15 +291,20 @@ write_sshd_port() {
     printf '# Managed by SUF %s\nPort %s\n' "$APP_VERSION" "$port" >"$tmp"
   fi
   install -m 600 -o root -g root "$tmp" "$SSH_DROPIN"; rm -f "$tmp"
+  if ! disable_foreign_ssh_port_directives; then
+    warn "无法禁用其它 SSH Port 配置，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    die "没有应用任何 SSH 端口变更。"
+  fi
   if ! "$SSHD_BIN" -t; then
     warn "sshd 配置校验失败，正在自动恢复。"
     restore_ssh_backup "$backup_dir"
     "$SSHD_BIN" -t || die "旧配置恢复后仍无法通过校验，请保持当前会话并人工检查 ${SSH_MAIN}。"
     die "没有应用任何 SSH 变更。"
   fi
-  effective=$(effective_sshd_value port)
-  if [[ $effective != "$port" ]]; then
-    warn "新的 SSH 端口未生效，正在自动恢复。"
+  effective_ports=$(effective_sshd_values port)
+  if [[ $effective_ports != "$port" ]]; then
+    warn "最终 SSH 端口未收敛为 TCP/${port}，当前生效端口：${effective_ports//$'\n'/, }。正在自动恢复。"
     restore_ssh_backup "$backup_dir"
     "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
     die "没有应用任何 SSH 变更。"
@@ -287,7 +331,7 @@ show_ssh_status() {
   if rc-service sshd status >/dev/null 2>&1; then service_state='运行中'; else service_state='已停止或启动失败'; fi
   config=$("$SSHD_BIN" -T 2>/dev/null) || die "无法读取 SSH 生效配置。"
   root_config=$("$SSHD_BIN" -T -C "user=root,host=$(hostname),addr=127.0.0.1" 2>/dev/null) || root_config=$config
-  port=$(awk '$1 == "port" {print $2; exit}' <<<"$config")
+  port=$(awk '$1 == "port" { ports = ports ? ports ", " $2 : $2 } END { print ports }' <<<"$config")
   login_grace=$(awk '$1 == "logingracetime" {print $2; exit}' <<<"$config")
   max_auth=$(awk '$1 == "maxauthtries" {print $2; exit}' <<<"$config")
   pubkey=$(awk '$1 == "pubkeyauthentication" {print $2; exit}' <<<"$config")
@@ -370,13 +414,21 @@ restore_latest_ssh_backup() {
 }
 
 change_ssh_port() {
-  local current target
+  local current target active_ports foreign_directives
   ensure_openssh
   current=$(current_ssh_port)
   target=$(prompt_port "$DEFAULT_SSH_PORT" "新的 SSH 端口")
-  [[ $target != "$current" ]] || { info "目标端口与当前端口相同，未做修改。"; return; }
+  active_ports=$(effective_sshd_values port)
+  foreign_directives=$(active_foreign_ssh_port_directives)
+  [[ $target != "$current" || $active_ports != "$target" ]] || { info "目标端口与当前端口相同，未做修改。"; return; }
   warn "请先确认云厂商安全组已放行 TCP/${target}。"
   confirm "已经放行或服务器没有外部安全组吗？" || die "取消操作。"
+  if [[ -n $foreign_directives ]]; then
+    warn "检测到以下额外的 SSH Port 配置："
+    printf '%s\n' "$foreign_directives"
+    warn "继续后将注释以上配置，仅保留 TCP/${target}。"
+    confirm "确认仅保留新的 SSH 端口吗？" || die "取消操作。"
+  fi
   if command -v nft >/dev/null 2>&1 && nft_table_exists; then
     if nft list chain inet suf input 2>/dev/null | grep -Eq "tcp dport ${target}([[:space:]]|$)"; then
       info "nftables 已有 TCP/${target} 放行规则。"
