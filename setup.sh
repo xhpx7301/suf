@@ -16,9 +16,43 @@ validate_arguments() {
   esac
 }
 
+ensure_git() {
+  local package_manager
+  local -a elevate=()
+
+  command -v git >/dev/null 2>&1 && return
+
+  if [[ $EUID -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || die "未找到 git，且当前用户无法使用 sudo 自动安装。"
+    elevate=(sudo)
+  fi
+
+  [[ -r /etc/os-release ]] || die "未找到 git，且无法识别系统以自动安装。"
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  case "${ID:-}" in
+    debian|ubuntu) package_manager="apt-get" ;;
+    alpine) package_manager="apk" ;;
+    *) die "未找到 git，当前系统 ${ID:-unknown} 不支持自动安装。请先手动安装 git。" ;;
+  esac
+
+  info "未检测到 git，正在自动安装..."
+  case "$package_manager" in
+    apt-get)
+      "${elevate[@]}" apt-get update
+      "${elevate[@]}" apt-get install -y git
+      ;;
+    apk)
+      "${elevate[@]}" apk add --no-cache git
+      ;;
+  esac
+  command -v git >/dev/null 2>&1 || die "git 安装后仍不可用，请检查系统软件源。"
+  ok "git 已安装。"
+}
+
 prepare_repository() {
   local origin
-  command -v git >/dev/null 2>&1 || die "未找到 git，请先安装 git。"
+  ensure_git
   [[ ! -L $SUF_DIR ]] || die "${SUF_DIR} 是符号链接，拒绝继续。"
 
   if [[ -d ${SUF_DIR}/.git ]]; then

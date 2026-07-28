@@ -30,7 +30,13 @@ SUF 本身不是常驻服务。它只在执行命令时运行，适合资源有�
 
 ## 快捷安装
 
-首次安装和后续更新都使用同一条命令：
+首次安装和后续更新都可以使用这条命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xhpx7301/suf/main/setup.sh | bash
+```
+
+生产服务器如需先将脚本下载到本地再执行，可使用：
 
 ```bash
 SUF_SETUP="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/xhpx7301/suf/main/setup.sh -o "$SUF_SETUP" && bash "$SUF_SETUP"
@@ -38,6 +44,7 @@ SUF_SETUP="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/xhpx7301/s
 
 命令行为：
 
+- 首次运行若未安装 Git，会在 Debian/Ubuntu 上使用 `apt-get`、在 Alpine 上使用 `apk` 自动安装。
 - `$HOME/suf` 不存在：自动克隆仓库后安装。
 - `$HOME/suf` 已是正确仓库：自动执行 `git pull --ff-only` 后更新安装。
 - 目录不是 SUF 仓库或存在未提交修改：停止操作，不覆盖任何文件。
@@ -47,10 +54,10 @@ SUF_SETUP="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/xhpx7301/s
 不立即打开菜单：
 
 ```bash
-SUF_SETUP="$(mktemp)" && curl -fsSL https://raw.githubusercontent.com/xhpx7301/suf/main/setup.sh -o "$SUF_SETUP" && bash "$SUF_SETUP" --no-launch
+curl -fsSL https://raw.githubusercontent.com/xhpx7301/suf/main/setup.sh | bash -s -- --no-launch
 ```
 
-快捷命令先用 `mktemp` 创建唯一临时文件，再下载并执行脚本，没有使用远程内容直接管道到 root shell。
+`curl -fsSL ... | bash` 会直接执行下载内容；生产服务器如需审查脚本或避免直接管道执行，可使用上方的临时文件命令。
 
 ## 审查后安装
 
