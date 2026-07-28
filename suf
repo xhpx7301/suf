@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.2"
+APP_VERSION="1.2.3"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -358,16 +358,9 @@ restore_ssh_backup() {
 }
 
 ssh_config_includes_dropin_dir() {
-  awk -v directory="${SSH_DROPIN_DIR}/" '
-    $0 == "# BEGIN SUF managed include" { in_suf_include = 1; next }
-    $0 == "# END SUF managed include" { in_suf_include = 0; next }
-    !in_suf_include && tolower($1) == "include" {
-      for (i = 2; i <= NF; i++) {
-        if (index($i, directory) == 1) found = 1
-      }
-    }
-    END { exit !found }
-  ' "$SSH_MAIN"
+  local escaped_dir=${SSH_DROPIN_DIR//./\\.}
+  # Match the distribution-provided glob, not SUF's own explicit Include block.
+  grep -qE "^[[:space:]]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][[:space:]]+${escaped_dir}/\\*" "$SSH_MAIN"
 }
 
 remove_suf_managed_include() {
