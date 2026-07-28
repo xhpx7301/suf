@@ -357,8 +357,39 @@ restore_ssh_backup() {
   fi
 }
 
+ssh_config_includes_dropin_dir() {
+  awk -v directory="${SSH_DROPIN_DIR}/" '
+    $0 == "# BEGIN SUF managed include" { in_suf_include = 1; next }
+    $0 == "# END SUF managed include" { in_suf_include = 0; next }
+    !in_suf_include && tolower($1) == "include" {
+      for (i = 2; i <= NF; i++) {
+        if (index($i, directory) == 1) found = 1
+      }
+    }
+    END { exit !found }
+  ' "$SSH_MAIN"
+}
+
+remove_suf_managed_include() {
+  local tmp
+  grep -q '^# BEGIN SUF managed include$' "$SSH_MAIN" || return
+  tmp=$(mktemp)
+  awk '
+    $0 == "# BEGIN SUF managed include" { skip = 1; next }
+    $0 == "# END SUF managed include" { skip = 0; next }
+    !skip { print }
+  ' "$SSH_MAIN" >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$SSH_MAIN"
+  rm -f "$tmp"
+}
+
 ensure_dropin_include_first() {
   local tmp
+  # Debian/Ubuntu normally includes this directory already. Do not include SUF twice.
+  if ssh_config_includes_dropin_dir; then
+    remove_suf_managed_include
+    return
+  fi
   if head -n 4 "$SSH_MAIN" | grep -q '^# BEGIN SUF managed include$'; then
     return
   fi
