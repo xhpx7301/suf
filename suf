@@ -159,7 +159,8 @@ ensure_openssh() {
 
 effective_sshd_value() {
   local key=$1
-  "$SSHD_BIN" -T 2>/dev/null | awk -v wanted="$key" '$1 == wanted { print $2; exit }'
+  # Consume all sshd output: exiting awk early can make sshd receive SIGPIPE.
+  "$SSHD_BIN" -T 2>/dev/null | awk -v wanted="$key" '$1 == wanted && !found { print $2; found=1 }'
 }
 
 current_ssh_port() {
@@ -1352,6 +1353,60 @@ security_initialization_wizard() {
   warn "确认新连接成功后，再手动删除 UFW 中不需要的旧 SSH 端口规则。"
 }
 
+menu_action_label() {
+  case "$1" in
+    show_ssh_status) printf '查看 SSH 状态与安全配置' ;;
+    install_openssh_service) printf '安装/修复 OpenSSH 服务' ;;
+    ensure_openssh_and_key) printf '安装 SSH 公钥' ;;
+    enable_key_only_login) printf '启用仅密钥登录' ;;
+    change_ssh_port) printf '修改 SSH 端口' ;;
+    reload_ssh_service) printf '校验并重新加载 SSH' ;;
+    restore_latest_ssh_backup) printf '恢复 SSH 配置备份' ;;
+    show_ufw_status) printf '查看 UFW 状态' ;;
+    install_ufw_service) printf '安装 UFW' ;;
+    enable_ufw_service) printf '启用 UFW' ;;
+    disable_ufw_service) printf '关闭 UFW' ;;
+    uninstall_ufw_service) printf '卸载 UFW' ;;
+    show_ufw_rules) printf '查看 UFW 编号规则' ;;
+    ufw_delete_numbered_rule) printf '删除 UFW 编号规则' ;;
+    reload_ufw_service) printf '重新加载 UFW' ;;
+    show_ufw_allowed_ports) printf '查看 UFW 已放行端口' ;;
+    show_listening_ports) printf '查看监听端口' ;;
+    ufw_allow_port) printf '放行指定端口' ;;
+    ufw_allow_source_to_port) printf '限制端口访问来源' ;;
+    ufw_limit_port) printf '限制端口新连接' ;;
+    show_fail2ban_status) printf '查看 Fail2ban 状态' ;;
+    install_fail2ban_service) printf '安装 Fail2ban' ;;
+    configure_fail2ban) printf '配置 SSH 防护' ;;
+    reload_fail2ban_service) printf '重新加载 Fail2ban' ;;
+    unban_fail2ban_ip) printf '解除 Fail2ban 封禁' ;;
+    stop_fail2ban_service) printf '停止 Fail2ban' ;;
+    uninstall_fail2ban_service) printf '卸载 Fail2ban' ;;
+    show_status) printf '查看系统状态' ;;
+    security_initialization_wizard) printf '运行安全初始化向导' ;;
+    update_suf_project) printf '更新 SUF' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+explain_menu_failure() {
+  local action=$1 status=$2 label
+  label=$(menu_action_label "$action")
+  warn "操作未完成：${label}（退出码 ${status}）。"
+  case "${action}:${status}" in
+    change_ssh_port:141)
+      warn "问题位置：读取 SSH 当前生效配置。退出码 141 表示输出管道提前关闭（SIGPIPE）。"
+      warn "配置文件可能已写入，但 SSH 尚未重载，服务仍可能监听旧端口。可用菜单 6 校验并加载，或菜单 7 恢复备份。"
+      ;;
+    *:141)
+      warn "问题位置：${label} 使用的命令输出管道。退出码 141 表示输出被提前关闭（SIGPIPE）。"
+      ;;
+    *)
+      warn "问题位置：${label}。请查看上方第一条 [FAIL] 或系统命令错误；该行给出直接失败原因。"
+      ;;
+  esac
+}
+
 run_menu_action() {
   local status
   set +e
@@ -1362,7 +1417,7 @@ run_menu_action() {
   status=$?
   set -e
   if ((status != 0)); then
-    warn "操作未完成（退出码 ${status}）。请检查上方提示。"
+    explain_menu_failure "$1" "$status"
   fi
   pause
 }

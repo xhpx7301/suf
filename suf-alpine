@@ -85,7 +85,10 @@ find_sshd() {
   SSHD_BIN=$(command -v sshd)
 }
 
-effective_sshd_value() { "$SSHD_BIN" -T 2>/dev/null | awk -v wanted="$1" '$1 == wanted { print $2; exit }'; }
+effective_sshd_value() {
+  # Consume all sshd output: exiting awk early can make sshd receive SIGPIPE.
+  "$SSHD_BIN" -T 2>/dev/null | awk -v wanted="$1" '$1 == wanted && !found { print $2; found=1 }'
+}
 current_ssh_port() { local port; port=$(effective_sshd_value port || true); printf '%s\n' "${port:-22}"; }
 valid_port() { [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 
@@ -643,7 +646,65 @@ EOF
 project_dir() { [[ -n ${SUF_HOME:-} ]] && printf '%s\n' "$SUF_HOME" || printf '%s/suf\n' "$HOME"; }
 update_project() { local dir; apk_install git; dir=$(project_dir); [[ ! -L $dir ]] || die "${dir} 是符号链接，拒绝更新。"; if [[ -d ${dir}/.git ]]; then [[ $(git -C "$dir" remote get-url origin 2>/dev/null || true) == "${APP_REPOSITORY}.git" ]] || die "远程仓库不是 SUF。"; [[ -z $(git -C "$dir" status --porcelain) ]] || die "仓库存在未提交修改。"; git -C "$dir" pull --ff-only; elif [[ -e $dir ]]; then die "${dir} 不是 SUF Git 仓库。"; else git clone --depth 1 "${APP_REPOSITORY}.git" "$dir"; fi; [[ -f ${dir}/install.sh ]] || die "仓库中缺少 install.sh。"; bash "${dir}/install.sh" --no-launch; ok "SUF Alpine 已更新。"; }
 
-run_menu_action() { local status; set +e; (set -Eeuo pipefail; "$@"); status=$?; set -e; ((status == 0)) || warn "操作未完成（退出码 ${status}）。请检查上方提示。"; pause; }
+menu_action_label() {
+  case "$1" in
+    show_ssh_status) printf '查看 SSH 状态与安全配置' ;;
+    install_openssh_service) printf '安装/修复 OpenSSH 服务' ;;
+    ensure_openssh_and_key) printf '安装 SSH 公钥' ;;
+    enable_key_only_login) printf '启用仅密钥登录' ;;
+    change_ssh_port) printf '修改 SSH 端口' ;;
+    reload_ssh_service) printf '校验并重新加载 SSH' ;;
+    restore_latest_ssh_backup) printf '恢复 SSH 配置备份' ;;
+    show_nftables_status) printf '查看 nftables 状态' ;;
+    install_nftables_service) printf '安装 nftables' ;;
+    enable_nftables_service) printf '启用 nftables' ;;
+    disable_nftables_service) printf '关闭 nftables' ;;
+    uninstall_nftables_service) printf '卸载 nftables' ;;
+    reload_nftables) printf '重新加载 nftables' ;;
+    allow_nft_port) printf '放行 nftables 端口' ;;
+    show_listening_ports) printf '查看监听端口' ;;
+    fail2ban_status) printf '查看 Fail2ban 状态' ;;
+    install_fail2ban) printf '安装 Fail2ban' ;;
+    configure_current_fail2ban) printf '配置 SSH 防护' ;;
+    reload_fail2ban) printf '重新加载 Fail2ban' ;;
+    unban_fail2ban_ip) printf '解除 Fail2ban 封禁' ;;
+    stop_fail2ban) printf '停止 Fail2ban' ;;
+    uninstall_fail2ban) printf '卸载 Fail2ban' ;;
+    show_status) printf '查看系统状态' ;;
+    security_initialization_wizard) printf '运行安全初始化向导' ;;
+    update_project) printf '更新 SUF' ;;
+    show_runtime_status) printf '查看运行状态' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+explain_menu_failure() {
+  local action=$1 status=$2 label
+  label=$(menu_action_label "$action")
+  warn "操作未完成：${label}（退出码 ${status}）。"
+  case "${action}:${status}" in
+    change_ssh_port:141)
+      warn "问题位置：读取 SSH 当前生效配置。退出码 141 表示输出管道提前关闭（SIGPIPE）。"
+      warn "配置文件可能已写入，但 SSH 尚未重载，服务仍可能监听旧端口。可用菜单 6 校验并加载，或菜单 7 恢复备份。"
+      ;;
+    *:141)
+      warn "问题位置：${label} 使用的命令输出管道。退出码 141 表示输出被提前关闭（SIGPIPE）。"
+      ;;
+    *)
+      warn "问题位置：${label}。请查看上方第一条 [FAIL] 或系统命令错误；该行给出直接失败原因。"
+      ;;
+  esac
+}
+
+run_menu_action() {
+  local status
+  set +e
+  (set -Eeuo pipefail; "$@")
+  status=$?
+  set -e
+  ((status == 0)) || explain_menu_failure "$1" "$status"
+  pause
+}
 
 ssh_status_badge() {
   if ! command -v sshd >/dev/null 2>&1; then
