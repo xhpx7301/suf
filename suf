@@ -933,6 +933,31 @@ ufw_delete_numbered_rule() {
   show_ufw_rules
 }
 
+ufw_delete_port_rules() {
+  local port protocol index
+  local -a numbers=()
+  require_ufw
+  port=$(prompt_port 443 "要删除规则的端口")
+  protocol=$(prompt_protocol)
+
+  # A single UFW rule normally creates adjacent IPv4 and IPv6 entries.  Capture
+  # their current numbers first, then delete in reverse so renumbering is harmless.
+  mapfile -t numbers < <(
+    ufw status numbered | sed -nE "s/^\\[[[:space:]]*([0-9]+)\\][[:space:]]+${port}\\/${protocol}( \\(v6\\))?([[:space:]].*)?$/\\1/p"
+  )
+  ((${#numbers[@]} > 0)) || die "未找到 ${port}/${protocol} 的 UFW 规则。"
+
+  printf '将删除 %s/%s 的以下规则编号：%s\n' "$port" "$protocol" "${numbers[*]}"
+  warn "这会同时删除匹配的 IPv4 和 IPv6 规则；删除后其他规则编号会变化。"
+  confirm "确认删除这些规则吗？" || die "取消删除。"
+
+  for ((index = ${#numbers[@]} - 1; index >= 0; index--)); do
+    ufw --force delete "${numbers[index]}"
+  done
+  ok "已删除 ${port}/${protocol} 的 ${#numbers[@]} 条规则。"
+  show_ufw_rules
+}
+
 ufw_is_active() {
   command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active$'
 }
@@ -1563,6 +1588,7 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （11）放行指定端口
 （12）仅允许指定 IP/CIDR 访问端口
 （13）为端口添加连接限速
+（14）按端口删除规则（IPv4/IPv6）
 （0）返回一级菜单
 EOF
     printf '\n'
@@ -1581,6 +1607,7 @@ EOF
       11) run_menu_action ufw_allow_port ;;
       12) run_menu_action ufw_allow_source_to_port ;;
       13) run_menu_action ufw_limit_port ;;
+      14) run_menu_action ufw_delete_port_rules ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
