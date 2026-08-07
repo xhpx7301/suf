@@ -937,6 +937,10 @@ ufw_delete_port_rules() {
   local port protocol index
   local -a numbers=()
   require_ufw
+
+  printf '请选择要删除的已放行或限速端口：\n'
+  show_ufw_allowed_ports
+  printf '\n'
   port=$(prompt_port 443 "要删除规则的端口")
   protocol=$(prompt_protocol)
 
@@ -949,7 +953,7 @@ ufw_delete_port_rules() {
 
   printf '将删除 %s/%s 的以下规则编号：%s\n' "$port" "$protocol" "${numbers[*]}"
   warn "这会同时删除匹配的 IPv4 和 IPv6 规则；删除后其他规则编号会变化。"
-  confirm "确认删除这些规则吗？" || die "取消删除。"
+  confirm "确认删除这些规则吗？请输入 y 执行删除" || die "取消删除。"
 
   for ((index = ${#numbers[@]} - 1; index >= 0; index--)); do
     ufw --force delete "${numbers[index]}"
@@ -1588,7 +1592,7 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （11）放行指定端口
 （12）仅允许指定 IP/CIDR 访问端口
 （13）为端口添加连接限速
-（14）按端口删除规则（IPv4/IPv6）
+（14）按端口删除已放行规则（IPv4/IPv6）
 （0）返回一级菜单
 EOF
     printf '\n'
