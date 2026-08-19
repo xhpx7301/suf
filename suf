@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.4"
+APP_VERSION="1.2.5"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -11,6 +11,7 @@ SSH_DROPIN="${SSH_DROPIN_DIR}/00-suf-hardening.conf"
 BACKUP_ROOT="/var/backups/${APP_NAME}"
 FAIL2BAN_JAIL_DIR="/etc/fail2ban/jail.d"
 FAIL2BAN_JAIL_FILE="${FAIL2BAN_JAIL_DIR}/${APP_NAME}.local"
+DOCKER_RULES_FILE="/etc/${APP_NAME}/docker-source-rules.conf"
 LAST_CONFIGURED_USER=""
 export LC_ALL=C
 
@@ -939,6 +940,41 @@ ensure_docker_nft_jump() {
   fi
 }
 
+remember_docker_source_rule() {
+  local source=$1 port=$2 protocol=$3 entry
+  entry="${source}|${port}|${protocol}"
+  install -d -m 700 "$(dirname "$DOCKER_RULES_FILE")"
+  touch "$DOCKER_RULES_FILE"
+  if ! grep -Fqx "$entry" "$DOCKER_RULES_FILE"; then
+    printf '%s\n' "$entry" >>"$DOCKER_RULES_FILE"
+  fi
+  chmod 600 "$DOCKER_RULES_FILE"
+}
+
+restore_docker_runtime_links() {
+  local family
+  command -v nft >/dev/null 2>&1 || return 0
+  for family in ip ip6; do
+    if nft list chain "$family" filter SUF-DOCKER >/dev/null 2>&1; then
+      ensure_docker_nft_jump "$family"
+      ensure_docker_nft_established_rule "$family" SUF-DOCKER "SUF-DOCKER-ESTABLISHED"
+    fi
+  done
+}
+
+restore_docker_firewall_rules() {
+  local source port protocol
+  restore_docker_runtime_links
+  [[ -f $DOCKER_RULES_FILE ]] || return 0
+
+  while IFS='|' read -r source port protocol; do
+    [[ -n ${source:-} && -n ${port:-} && -n ${protocol:-} ]] || continue
+    [[ $source =~ ^[0-9A-Fa-f:.\/]+$ && $port =~ ^[0-9]+$ && $protocol =~ ^(tcp|udp)$ ]] || continue
+    apply_docker_source_restriction "$source" "$port" "$protocol" || \
+      warn "恢复 Docker 来源限制失败：${source} ${port}/${protocol}。"
+  done <"$DOCKER_RULES_FILE"
+}
+
 apply_docker_source_restriction_nft() {
   local source=$1 port=$2 protocol=$3 family opposite address_expr allow_comment drop_comment
   [[ $source == *:* ]] && family=ip6 || family=ip
@@ -1038,6 +1074,7 @@ ufw_allow_source_to_port() {
     if ! apply_docker_source_restriction "$source" "$port" "$protocol"; then
       die "UFW 规则已添加，但 Docker-USER 规则写入失败；Docker 端口仍可能绕过来源限制。请检查 ${firewall} conntrack 支持后重试。"
     fi
+    remember_docker_source_rule "$source" "$port" "$protocol"
     warn "已同步限制 Docker 发布端口：${firewall} DOCKER-USER（按原始目标端口匹配）。"
   elif command -v docker >/dev/null 2>&1; then
     die "检测到 Docker，但 ${firewall} 的 DOCKER-USER 链不可用；UFW 规则不能限制 Docker 转发流量。请启动 Docker 后重试。"
@@ -1127,13 +1164,15 @@ enable_ufw_service() {
   ufw show added || true
   confirm "确认以上规则完整，可以启用 UFW 吗？" || die "未启用 UFW。"
   ufw --force enable
+  restore_docker_firewall_rules
   show_ufw_status
 }
 
 reload_ufw_service() {
   require_ufw
   ufw reload
-  ok "UFW 规则已重新加载。"
+  restore_docker_firewall_rules
+  ok "UFW 规则已重新加载，Docker 来源限制已恢复。"
 }
 
 disable_ufw_service() {
