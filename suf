@@ -913,9 +913,19 @@ docker_uses_nft_backend() {
   "$firewall" -V 2>/dev/null | grep -q 'nf_tables'
 }
 
+apply_docker_nft_family_drop() {
+  local family=$1 port=$2 protocol=$3 drop_comment=$4
+  # If Docker has IPv4/IPv6 disabled, there may be no corresponding chain.
+  nft list chain "$family" filter DOCKER-USER >/dev/null 2>&1 || return 0
+  if ! nft list chain "$family" filter DOCKER-USER 2>/dev/null | grep -Fq "comment \"${drop_comment}\""; then
+    nft insert rule "$family" filter DOCKER-USER meta l4proto "$protocol" ct original proto-dst "$port" counter drop comment "$drop_comment"
+  fi
+}
+
 apply_docker_source_restriction_nft() {
-  local source=$1 port=$2 protocol=$3 family address_expr allow_comment drop_comment
+  local source=$1 port=$2 protocol=$3 family opposite address_expr allow_comment drop_comment
   [[ $source == *:* ]] && family=ip6 || family=ip
+  [[ $family == ip6 ]] && opposite=ip || opposite=ip6
   nft list chain "$family" filter DOCKER-USER >/dev/null 2>&1 || return 2
 
   if [[ $family == ip6 ]]; then
@@ -935,6 +945,11 @@ apply_docker_source_restriction_nft() {
   if ! nft list chain "$family" filter DOCKER-USER 2>/dev/null | grep -Fq "comment \"${allow_comment}\""; then
     nft insert rule "$family" filter DOCKER-USER "${address_expr[@]}" meta l4proto "$protocol" ct original proto-dst "$port" counter accept comment "$allow_comment"
   fi
+
+  # A whitelist for one address family must not leave the other published
+  # family open.  A later whitelist call for that family is inserted before
+  # this drop rule, so IPv4 and IPv6 sources can still be configured separately.
+  apply_docker_nft_family_drop "$opposite" "$port" "$protocol" "SUF-DOCKER-DROP-${port}-${protocol}-${opposite}"
 }
 
 apply_docker_source_restriction() {
