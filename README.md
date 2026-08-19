@@ -244,7 +244,7 @@ sudo bash ./uninstall.sh
 - UFW 无法替代云安全组，两层都要正确配置。
 - Docker 发布端口可能绕过部分 UFW 入站路径，需要单独审核 Docker/iptables 规则。
 - “仅允许指定 IP”会检查并要求删除同端口的广泛 `allow` 或 `limit` 规则；检测到 Docker 的 `DOCKER-USER` 链时，还会按 DNAT 前的原始目标端口同步限制规则。
-- Docker 发布端口必须使用 UFW 菜单中的“仅允许指定 IP/CIDR 访问端口”重新配置；仅添加 `ufw allow from ...` 不足以限制 Docker 转发流量。IPv4 和 IPv6 需要分别配置，Docker 重启后应复核 `iptables -S DOCKER-USER` 或重新执行该操作。
+- Docker 发布端口必须使用 UFW 菜单中的“仅允许指定 IP/CIDR 访问端口”重新配置；仅添加 `ufw allow from ...` 不足以限制 Docker 转发流量。IPv4 和 IPv6 需要分别配置。使用 `iptables-nft` 后端时，应通过 `nft list chain ip filter DOCKER-USER`（或 `ip6 filter`）复核，而不是只看 `iptables -S`；Docker 重启后也应复核或重新执行该操作。
 - 默认 root 密钥直登能减少权限操作障碍，但私钥泄露会直接导致最高权限失陷，必须设置私钥口令并妥善备份。
 - SUF 使用 `PermitRootLogin prohibit-password`，不会使用允许 root 密码登录的 `PermitRootLogin yes`。
 - 启用、关闭或卸载防火墙，停止或卸载 Fail2ban 等操作都需要确认输入 `y`；直接回车会取消操作。

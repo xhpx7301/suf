@@ -898,9 +898,43 @@ remove_broad_ufw_allows() {
 }
 
 docker_user_chain_exists() {
+  local firewall=$1 family
+  if command -v "$firewall" >/dev/null 2>&1 && "$firewall" -nL DOCKER-USER >/dev/null 2>&1; then
+    return 0
+  fi
+  command -v nft >/dev/null 2>&1 || return 1
+  [[ $firewall == ip6tables ]] && family=ip6 || family=ip
+  nft list chain "$family" filter DOCKER-USER >/dev/null 2>&1
+}
+
+docker_uses_nft_backend() {
   local firewall=$1
-  command -v "$firewall" >/dev/null 2>&1 || return 1
-  "$firewall" -nL DOCKER-USER >/dev/null 2>&1
+  command -v nft >/dev/null 2>&1 || return 1
+  "$firewall" -V 2>/dev/null | grep -q 'nf_tables'
+}
+
+apply_docker_source_restriction_nft() {
+  local source=$1 port=$2 protocol=$3 family address_expr allow_comment drop_comment
+  [[ $source == *:* ]] && family=ip6 || family=ip
+  nft list chain "$family" filter DOCKER-USER >/dev/null 2>&1 || return 2
+
+  if [[ $family == ip6 ]]; then
+    address_expr=(ip6 saddr "$source")
+  else
+    address_expr=(ip saddr "$source")
+  fi
+  allow_comment="SUF-DOCKER-ALLOW-${source}-${port}-${protocol}"
+  drop_comment="SUF-DOCKER-DROP-${port}-${protocol}"
+
+  # Native nft rules are required when iptables-nft reports a chain as
+  # incompatible.  Insert the drop first, then put each whitelist entry in
+  # front of it so repeated calls remain additive.
+  if ! nft list chain "$family" filter DOCKER-USER 2>/dev/null | grep -Fq "comment \"${drop_comment}\""; then
+    nft insert rule "$family" filter DOCKER-USER meta l4proto "$protocol" ct original proto-dst "$port" counter drop comment "$drop_comment"
+  fi
+  if ! nft list chain "$family" filter DOCKER-USER 2>/dev/null | grep -Fq "comment \"${allow_comment}\""; then
+    nft insert rule "$family" filter DOCKER-USER "${address_expr[@]}" meta l4proto "$protocol" ct original proto-dst "$port" counter accept comment "$allow_comment"
+  fi
 }
 
 apply_docker_source_restriction() {
@@ -916,6 +950,11 @@ apply_docker_source_restriction() {
   fi
 
   docker_user_chain_exists "$firewall" || return 2
+
+  if docker_uses_nft_backend "$firewall"; then
+    apply_docker_source_restriction_nft "$source" "$port" "$protocol"
+    return
+  fi
 
   "$firewall" -N SUF-DOCKER 2>/dev/null || true
   if ! "$firewall" -C DOCKER-USER -j SUF-DOCKER >/dev/null 2>&1; then
