@@ -107,7 +107,7 @@ suf --help          # 查看帮助
 ## 菜单结构
 
 ```text
-SUF 1.2.2 - Server UFW & SSH Fortress
+SUF 1.2.4 - Server UFW & SSH Fortress
 
 （1）SSH 与密钥管理
 （2）UFW 防火墙管理
@@ -160,7 +160,7 @@ SUF 1.2.2 - Server UFW & SSH Fortress
 | `9` 查看 UFW 已放行端口 | 列出已保存的 `allow` 和 `limit` 规则；即使 UFW 尚未启用，也可查看将在启用后生效的端口。 |
 | `10` 查看实际监听端口并按需放行 | 先显示全部监听详情和“公网监听候选”。可选择一个正在监听的端口加入 UFW 放行；仅本机地址 `127.0.0.1` 或 `[::1]` 的服务不能通过此菜单开放。 |
 | `11` 放行指定端口 | 允许所有来源访问指定 TCP 或 UDP 端口。只用于确实需要公开的服务。 |
-| `12` 仅允许指定 IP/CIDR 访问端口 | 仅向一个 IP 或网段开放端口；SUF 会检查并要求删除同端口的广泛放行规则。 |
+| `12` 仅允许指定 IP/CIDR 访问端口 | 仅向一个 IP 或网段开放端口；SUF 会检查并要求删除同端口的广泛放行规则。检测到 Docker 时，会同时维护 `DOCKER-USER` 前置链；重复执行可添加多个白名单来源。 |
 | `13` 为端口添加连接限速 | 对 TCP 新连接施加 UFW 限速，适合 SSH 等管理端口；默认显示当前实际 SSH 端口，也可输入其他 TCP 端口。不能替代密钥认证或 Fail2ban。 |
 | `14` 按端口删除已放行规则（IPv4/IPv6） | 先列出当前已保存的 `allow` 和 `limit` 端口，再输入端口和协议。确认输入 `y` 后，删除该端口匹配的所有 UFW IPv4 与 IPv6 规则。脚本会按编号从大到小删除，避免规则重新编号导致漏删。 |
 
@@ -243,7 +243,8 @@ sudo bash ./uninstall.sh
 - 不推荐使用 `curl URL | sudo bash`，应先下载或克隆并审查脚本。
 - UFW 无法替代云安全组，两层都要正确配置。
 - Docker 发布端口可能绕过部分 UFW 入站路径，需要单独审核 Docker/iptables 规则。
-- “仅允许指定 IP”会检查并要求删除同端口的广泛 `allow` 或 `limit` 规则。
+- “仅允许指定 IP”会检查并要求删除同端口的广泛 `allow` 或 `limit` 规则；检测到 Docker 的 `DOCKER-USER` 链时，还会按 DNAT 前的原始目标端口同步限制规则。
+- Docker 发布端口必须使用 UFW 菜单中的“仅允许指定 IP/CIDR 访问端口”重新配置；仅添加 `ufw allow from ...` 不足以限制 Docker 转发流量。IPv4 和 IPv6 需要分别配置，Docker 重启后应复核 `iptables -S DOCKER-USER` 或重新执行该操作。
 - 默认 root 密钥直登能减少权限操作障碍，但私钥泄露会直接导致最高权限失陷，必须设置私钥口令并妥善备份。
 - SUF 使用 `PermitRootLogin prohibit-password`，不会使用允许 root 密码登录的 `PermitRootLogin yes`。
 - 启用、关闭或卸载防火墙，停止或卸载 Fail2ban 等操作都需要确认输入 `y`；直接回车会取消操作。

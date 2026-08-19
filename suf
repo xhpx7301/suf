@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.3"
+APP_VERSION="1.2.4"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -897,8 +897,46 @@ remove_broad_ufw_allows() {
   fi
 }
 
+docker_user_chain_exists() {
+  local firewall=$1
+  command -v "$firewall" >/dev/null 2>&1 || return 1
+  "$firewall" -nL DOCKER-USER >/dev/null 2>&1
+}
+
+apply_docker_source_restriction() {
+  local source=$1 port=$2 protocol=$3 firewall allow_rule drop_rule
+
+  # Docker publishes ports through FORWARD/DOCKER, so UFW INPUT rules do not
+  # reliably see that traffic.  DOCKER-USER is evaluated before Docker's own
+  # accept rules; --ctorigdstport matches the host port before DNAT.
+  if [[ $source == *:* ]]; then
+    firewall=ip6tables
+  else
+    firewall=iptables
+  fi
+
+  docker_user_chain_exists "$firewall" || return 2
+
+  "$firewall" -N SUF-DOCKER 2>/dev/null || true
+  if ! "$firewall" -C DOCKER-USER -j SUF-DOCKER >/dev/null 2>&1; then
+    "$firewall" -I DOCKER-USER 1 -j SUF-DOCKER
+  fi
+
+  allow_rule=(-s "$source" -p "$protocol" -m conntrack --ctorigdstport "$port" -m comment --comment SUF-DOCKER-ALLOW -j ACCEPT)
+  drop_rule=(-p "$protocol" -m conntrack --ctorigdstport "$port" -m comment --comment SUF-DOCKER-DROP -j DROP)
+
+  if ! "$firewall" -C SUF-DOCKER "${drop_rule[@]}" >/dev/null 2>&1; then
+    "$firewall" -A SUF-DOCKER "${drop_rule[@]}"
+  fi
+  if ! "$firewall" -C SUF-DOCKER "${allow_rule[@]}" >/dev/null 2>&1; then
+    # Put every allow before the chain's final drop so multiple whitelist
+    # entries remain additive instead of blocking an earlier source.
+    "$firewall" -I SUF-DOCKER 1 "${allow_rule[@]}"
+  fi
+}
+
 ufw_allow_source_to_port() {
-  local source port protocol
+  local source port protocol firewall
   require_ufw
   read -r -p "允许的来源 IP 或 CIDR：" source
   [[ $source =~ ^[0-9A-Fa-f:./]+$ ]] || die "IP/CIDR 包含无效字符。"
@@ -908,6 +946,20 @@ ufw_allow_source_to_port() {
   # UFW performs the final IPv4/IPv6 and CIDR validation.
   ufw allow from "$source" to any port "$port" proto "$protocol" comment '仅限指定来源'
   remove_broad_ufw_allows "$port" "$protocol"
+
+  if [[ $source == *:* ]]; then
+    firewall=ip6tables
+  else
+    firewall=iptables
+  fi
+  if docker_user_chain_exists "$firewall"; then
+    if ! apply_docker_source_restriction "$source" "$port" "$protocol"; then
+      die "UFW 规则已添加，但 Docker-USER 规则写入失败；Docker 端口仍可能绕过来源限制。请检查 ${firewall} conntrack 支持后重试。"
+    fi
+    warn "已同步限制 Docker 发布端口：${firewall} DOCKER-USER（按原始目标端口匹配）。"
+  elif command -v docker >/dev/null 2>&1; then
+    die "检测到 Docker，但 ${firewall} 的 DOCKER-USER 链不可用；UFW 规则不能限制 Docker 转发流量。请启动 Docker 后重试。"
+  fi
   ok "已限制为 ${source} 可访问 ${port}/${protocol}。"
 }
 
