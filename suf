@@ -918,7 +918,24 @@ apply_docker_nft_family_drop() {
   # If Docker has IPv4/IPv6 disabled, there may be no corresponding chain.
   nft list chain "$family" filter DOCKER-USER >/dev/null 2>&1 || return 0
   if ! nft list chain "$family" filter DOCKER-USER 2>/dev/null | grep -Fq "comment \"${drop_comment}\""; then
-    nft insert rule "$family" filter DOCKER-USER meta l4proto "$protocol" ct original proto-dst "$port" counter drop comment "$drop_comment"
+    nft insert rule "$family" filter DOCKER-USER ct state new meta l4proto "$protocol" ct original proto-dst "$port" counter drop comment "$drop_comment"
+  fi
+}
+
+ensure_docker_nft_established_rule() {
+  local family=$1 chain=$2 comment=$3
+  nft list chain "$family" filter "$chain" >/dev/null 2>&1 || return 0
+  if ! nft list chain "$family" filter "$chain" 2>/dev/null | grep -Fq "comment \"${comment}\""; then
+    nft insert rule "$family" filter "$chain" ct state established,related counter accept comment "$comment"
+  fi
+}
+
+ensure_docker_nft_jump() {
+  local family=$1
+  nft list chain "$family" filter SUF-DOCKER >/dev/null 2>&1 || return 0
+  nft list chain "$family" filter DOCKER-USER >/dev/null 2>&1 || return 0
+  if ! nft list chain "$family" filter DOCKER-USER 2>/dev/null | grep -Fq 'jump SUF-DOCKER'; then
+    nft insert rule "$family" filter DOCKER-USER jump SUF-DOCKER comment "SUF-DOCKER-JUMP"
   fi
 }
 
@@ -927,6 +944,13 @@ apply_docker_source_restriction_nft() {
   [[ $source == *:* ]] && family=ip6 || family=ip
   [[ $family == ip6 ]] && opposite=ip || opposite=ip6
   nft list chain "$family" filter DOCKER-USER >/dev/null 2>&1 || return 2
+
+  ensure_docker_nft_jump "$family"
+  if nft list chain "$family" filter SUF-DOCKER >/dev/null 2>&1; then
+    ensure_docker_nft_established_rule "$family" SUF-DOCKER "SUF-DOCKER-ESTABLISHED"
+  else
+    ensure_docker_nft_established_rule "$family" DOCKER-USER "SUF-DOCKER-ESTABLISHED"
+  fi
 
   if [[ $family == ip6 ]]; then
     address_expr=(ip6 saddr "$source")
@@ -940,7 +964,7 @@ apply_docker_source_restriction_nft() {
   # incompatible.  Insert the drop first, then put each whitelist entry in
   # front of it so repeated calls remain additive.
   if ! nft list chain "$family" filter DOCKER-USER 2>/dev/null | grep -Fq "comment \"${drop_comment}\""; then
-    nft insert rule "$family" filter DOCKER-USER meta l4proto "$protocol" ct original proto-dst "$port" counter drop comment "$drop_comment"
+    nft insert rule "$family" filter DOCKER-USER ct state new meta l4proto "$protocol" ct original proto-dst "$port" counter drop comment "$drop_comment"
   fi
   if ! nft list chain "$family" filter DOCKER-USER 2>/dev/null | grep -Fq "comment \"${allow_comment}\""; then
     nft insert rule "$family" filter DOCKER-USER "${address_expr[@]}" meta l4proto "$protocol" ct original proto-dst "$port" counter accept comment "$allow_comment"
@@ -953,7 +977,7 @@ apply_docker_source_restriction_nft() {
 }
 
 apply_docker_source_restriction() {
-  local source=$1 port=$2 protocol=$3 firewall allow_rule drop_rule
+  local source=$1 port=$2 protocol=$3 firewall allow_rule drop_rule established_rule
 
   # Docker publishes ports through FORWARD/DOCKER, so UFW INPUT rules do not
   # reliably see that traffic.  DOCKER-USER is evaluated before Docker's own
@@ -976,8 +1000,12 @@ apply_docker_source_restriction() {
     "$firewall" -I DOCKER-USER 1 -j SUF-DOCKER
   fi
 
+  established_rule=(-m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment SUF-DOCKER-ESTABLISHED -j ACCEPT)
+  if ! "$firewall" -C SUF-DOCKER "${established_rule[@]}" >/dev/null 2>&1; then
+    "$firewall" -I SUF-DOCKER 1 "${established_rule[@]}"
+  fi
   allow_rule=(-s "$source" -p "$protocol" -m conntrack --ctorigdstport "$port" -m comment --comment SUF-DOCKER-ALLOW -j ACCEPT)
-  drop_rule=(-p "$protocol" -m conntrack --ctorigdstport "$port" -m comment --comment SUF-DOCKER-DROP -j DROP)
+  drop_rule=(-p "$protocol" -m conntrack --ctstate NEW --ctorigdstport "$port" -m comment --comment SUF-DOCKER-DROP -j DROP)
 
   if ! "$firewall" -C SUF-DOCKER "${drop_rule[@]}" >/dev/null 2>&1; then
     "$firewall" -A SUF-DOCKER "${drop_rule[@]}"
