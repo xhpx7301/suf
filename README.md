@@ -18,6 +18,7 @@ SUF 本身不是常驻服务。它只在执行命令时运行，适合资源有�
 - 修改失败次数、统计窗口和封禁时间
 - 查看整体状态、监听端口和封禁信息
 - SSH 与 Fail2ban 配置修改前自动备份
+- 首次安装保存 Debian/Ubuntu 的安装前配置；可按可用备份恢复并卸载，逐项显示实际结果
 
 ## 支持范围
 
@@ -115,6 +116,7 @@ SUF 1.2.5 - Server UFW & SSH Fortress
 （4）查看整体安全状态
 （5）安全初始化向导
 （6）更新 SUF 项目
+（7）卸载 SUF 并按备份恢复设置
 （0）退出
 ```
 
@@ -132,6 +134,7 @@ SUF 1.2.5 - Server UFW & SSH Fortress
 | `4` 查看整体安全状态 | 汇总 SSH、UFW、Fail2ban 的当前状态。 | 配置后检查，或排查问题前先了解现状。 |
 | `5` 安全初始化向导 | 先展示密钥、SSH 端口、UFW 和 Fail2ban 的变更清单；确认后按顺序执行。新 SSH 端口和当前 SSH 端口会在启用 UFW 前自动放行。 | 新服务器且已确认全部公网服务端口时使用。 |
 | `6` 更新 SUF 项目 | 从 GitHub 拉取项目更新并重新安装命令。更新前会核验远程仓库地址，并拒绝覆盖有未提交修改的本地仓库。 | 日常更新 SUF，不必重复执行下载 `setup.sh` 的长命令。 |
+| `7` 卸载 SUF 并按备份恢复设置 | 先预览可恢复范围，经确认后恢复 SSH、UFW、Fail2ban 中有可靠快照的项目，并报告恢复后的状态。 | 不再使用 SUF，且希望尽可能回到安装前设置时使用。 |
 
 ### SSH 与密钥管理
 
@@ -220,18 +223,29 @@ sudo bash ./install.sh --no-launch
 
 ## 卸载 SUF
 
+仅删除 SUF 命令、保留安全配置：
+
 ```bash
 sudo bash ./uninstall.sh
 ```
 
-卸载程序只删除 SUF 命令，不会撤销 SSH、UFW 或 Fail2ban 配置，也不会删除备份。
-确认卸载时输入 `y`；输入 `n` 或直接按 Enter 会取消。
+按备份恢复后卸载（Debian/Ubuntu），也可在一级菜单选择 `7`：
+
+```bash
+sudo bash ./uninstall.sh --restore
+```
+
+全新安装且没有旧 SUF 备份时，会将 SSH、UFW 和 SUF 的 Fail2ban jail 及服务状态保存到 `/var/backups/suf/original-state`，后续更新不会覆盖。恢复前会显示每项的备份来源；恢复后会显示 SSH 生效配置、UFW 状态与已保存规则、Fail2ban 状态。恢复 SSH 后必须保持当前会话，并从新终端验证登录。卸载前的当前配置也会另存到 `/var/backups/suf/uninstall-*`，备份不会随卸载删除。
+
+从旧版本更新的服务器没有安装前的 UFW、Fail2ban 快照，因此这两项会保留现状并明确提示；SSH 如有 SUF 的最早操作前备份，可按该备份恢复。恢复流程不会声称无法验证的项目已回到安装前状态。已安装的公钥、新建的账号、Docker 运行时来源规则及软件包不会自动移除；请根据最终结果单独核对。输入 `n` 或直接按 Enter 会取消卸载。
 
 ## 配置与备份位置
 
 ```text
 /usr/local/sbin/suf
 /usr/local/bin/suf -> /usr/local/sbin/suf
+/usr/local/sbin/suf-uninstall
+/var/backups/suf/original-state（首次安装的配置快照）
 /etc/ssh/sshd_config.d/00-suf-hardening.conf
 /etc/fail2ban/jail.d/suf.local
 /etc/nftables.d/suf.nft（Alpine）

@@ -1844,6 +1844,7 @@ SUF ${APP_VERSION} - Server UFW & SSH Fortress (Debian/Ubuntu)
 （4）查看整体安全状态
 （5）安全初始化向导
 （6）更新 SUF 项目
+（7）卸载 SUF 并按备份恢复设置
 （0）退出
 EOF
     printf '\n'
@@ -1855,6 +1856,14 @@ EOF
       4) run_menu_action show_status ;;
       5) run_menu_action security_initialization_wizard ;;
       6) run_menu_action update_suf_project ;;
+      7)
+        if [[ -x /usr/local/sbin/suf-uninstall ]]; then
+          if /usr/local/sbin/suf-uninstall --restore; then exit 0; fi
+        else
+          warn "未找到卸载程序，请重新安装 SUF 后重试。"
+        fi
+        pause
+        ;;
       0) exit 0 ;;
       *) warn "无效选项。"; pause ;;
     esac

@@ -3,7 +3,9 @@ set -Eeuo pipefail
 
 TARGET="/usr/local/sbin/suf"
 LINK="/usr/local/bin/suf"
+UNINSTALL_TARGET="/usr/local/sbin/suf-uninstall"
 BACKUP_DIR="/var/backups/suf/installer"
+ORIGINAL_DIR="/var/backups/suf/original-state"
 NO_LAUNCH=0
 
 case "${1:-}" in
@@ -40,8 +42,66 @@ esac
 [[ -f $SOURCE ]] || die "未找到主程序：${SOURCE}"
 bash -n "$SOURCE" || die "suf 未通过 Bash 语法校验。"
 grep -q '^APP_NAME="suf"$' "$SOURCE" || die "主程序身份校验失败。"
+[[ -f ${SCRIPT_DIR}/uninstall.sh ]] || die "未找到卸载程序。"
+bash -n "${SCRIPT_DIR}/uninstall.sh" || die "卸载程序未通过 Bash 语法校验。"
+[[ ! -L $UNINSTALL_TARGET ]] || die "${UNINSTALL_TARGET} 是符号链接，拒绝覆盖。"
+[[ ! -e $UNINSTALL_TARGET || -f $UNINSTALL_TARGET ]] || die "${UNINSTALL_TARGET} 不是普通文件，拒绝覆盖。"
+if [[ -f $UNINSTALL_TARGET ]]; then
+  grep -qFx '# SUF uninstaller' "$UNINSTALL_TARGET" || die "${UNINSTALL_TARGET} 不是 SUF 卸载程序，拒绝覆盖。"
+fi
+
+capture_original_state() {
+  local staging
+  [[ ${ID:-} == debian || ${ID:-} == ubuntu ]] || return 0
+  [[ -e $TARGET || -L $TARGET || -d $ORIGINAL_DIR ]] && return 0
+  if [[ -e /var/backups/suf ]]; then
+    printf '[WARN] 检测到旧 SUF 备份，无法确认当前设置是首次安装前状态；不创建原始快照。\n'
+    return 0
+  fi
+
+  install -d -m 700 -o root -g root /var/backups/suf
+  staging=$(mktemp -d /var/backups/suf/.original-state.XXXXXX)
+  chmod 700 "$staging"
+  if [[ -f /etc/ssh/sshd_config && ! -L /etc/ssh/sshd_config ]]; then
+    cp -a /etc/ssh/sshd_config "$staging/sshd_config"
+  else
+    : >"$staging/ssh-config-unavailable"
+  fi
+  if [[ -L /etc/ssh/sshd_config.d ]]; then
+    : >"$staging/dropin-unavailable"
+  elif [[ -d /etc/ssh/sshd_config.d ]]; then
+    cp -a /etc/ssh/sshd_config.d "$staging/sshd_config.d"
+  else
+    : >"$staging/dropin-dir-was-absent"
+  fi
+  if [[ -L /etc/ufw ]]; then
+    : >"$staging/ufw-config-unavailable"
+  elif [[ -d /etc/ufw ]]; then
+    cp -a /etc/ufw "$staging/ufw"
+  else
+    : >"$staging/ufw-config-was-absent"
+  fi
+  if command -v ufw >/dev/null 2>&1 &&
+    ufw status 2>/dev/null | awk '$0 == "Status: active" { active = 1 } END { exit !active }'; then
+    printf 'active\n' >"$staging/ufw-state"
+  else
+    printf 'inactive\n' >"$staging/ufw-state"
+  fi
+  if [[ -L /etc/fail2ban/jail.d/suf.local ]]; then
+    : >"$staging/fail2ban-jail-unavailable"
+  elif [[ -f /etc/fail2ban/jail.d/suf.local ]]; then
+    cp -a /etc/fail2ban/jail.d/suf.local "$staging/fail2ban-suf.local"
+  else
+    : >"$staging/fail2ban-jail-was-absent"
+  fi
+  systemctl is-active fail2ban 2>/dev/null >"$staging/fail2ban-active" || true
+  systemctl is-enabled fail2ban 2>/dev/null >"$staging/fail2ban-enabled" || true
+  mv "$staging" "$ORIGINAL_DIR"
+  printf '[INFO] 安装前配置已保存到 %s；后续更新不会覆盖此快照。\n' "$ORIGINAL_DIR"
+}
 
 install -d -m 755 -o root -g root /usr/local/sbin /usr/local/bin
+capture_original_state
 
 if [[ -e $TARGET || -L $TARGET ]]; then
   [[ -f $TARGET && ! -L $TARGET ]] || die "${TARGET} 不是普通文件，拒绝覆盖。"
@@ -65,6 +125,12 @@ bash -n "$staged_target"
 mv -f "$staged_target" "$TARGET"
 trap - EXIT
 ln -sfn "$TARGET" "$LINK"
+staged_uninstaller=$(mktemp /usr/local/sbin/.suf-uninstall.install.XXXXXX)
+trap 'rm -f "$staged_uninstaller"' EXIT
+install -m 755 -o root -g root "${SCRIPT_DIR}/uninstall.sh" "$staged_uninstaller"
+bash -n "$staged_uninstaller"
+mv -f "$staged_uninstaller" "$UNINSTALL_TARGET"
+trap - EXIT
 
 printf '[ OK ] 已安装 %s\n' "$($TARGET --version)"
 printf '[ OK ] 现在可以执行：suf\n'
