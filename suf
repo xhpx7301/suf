@@ -366,7 +366,7 @@ ssh_config_includes_dropin_dir() {
 
 remove_suf_managed_include() {
   local tmp
-  grep -q '^# BEGIN SUF managed include$' "$SSH_MAIN" || return
+  grep -q '^# BEGIN SUF managed include$' "$SSH_MAIN" || return 0
   tmp=$(mktemp)
   awk '
     $0 == "# BEGIN SUF managed include" { skip = 1; next }
@@ -844,20 +844,30 @@ show_listening_ports() {
   [[ -n $candidates ]] || return
   confirm "要从上述公网监听端口中选择一个加入 UFW 放行规则吗？" || return
 
-  read -r -p "输入要放行的端口号：" port
-  valid_port "$port" || die "端口必须是 1 到 65535 的整数。"
-  port=$((10#$port))
-  protocol=$(prompt_protocol)
+  while true; do
+    read -r -p "输入要放行的端口号（直接回车结束）：" port || return 0
+    [[ -n $port ]] || return 0
+    if ! valid_port "$port"; then
+      warn "端口必须是 1 到 65535 的整数。"
+      continue
+    fi
+    port=$((10#$port))
+    protocol=$(prompt_protocol)
 
-  is_public_listening_port "$port" "$protocol" || die "未检测到 ${port}/${protocol} 的公网监听；仅本机监听的服务不能通过此菜单开放。"
-  if ufw show added | grep -Eq "^ufw (allow|limit) ${port}/${protocol}([[:space:]]|$)"; then
-    warn "已存在 ${port}/${protocol} 的广泛放行或限速规则，未重复添加。"
-  else
-    ufw allow "${port}/${protocol}" comment '从监听服务放行'
-    ok "已将正在监听的 ${port}/${protocol} 加入 UFW 放行规则。"
-  fi
-  printf '\n'
-  show_ufw_allowed_ports
+    if ! is_public_listening_port "$port" "$protocol"; then
+      warn "未检测到 ${port}/${protocol} 的公网监听；仅本机监听的服务不能通过此菜单开放。"
+      continue
+    fi
+    if ufw show added | grep -Eq "^ufw (allow|limit) ${port}/${protocol}([[:space:]]|$)"; then
+      warn "已存在 ${port}/${protocol} 的广泛放行或限速规则，未重复添加。"
+    else
+      ufw allow "${port}/${protocol}" comment '从监听服务放行'
+      ok "已将正在监听的 ${port}/${protocol} 加入 UFW 放行规则。"
+    fi
+    printf '\n'
+    show_ufw_allowed_ports
+    printf '\n'
+  done
 }
 
 ufw_allow_port() {

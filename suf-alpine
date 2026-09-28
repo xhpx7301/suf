@@ -227,7 +227,7 @@ ssh_config_includes_dropin_dir() {
 
 remove_suf_managed_include() {
   local tmp
-  grep -q '^# BEGIN SUF managed include$' "$SSH_MAIN" || return
+  grep -q '^# BEGIN SUF managed include$' "$SSH_MAIN" || return 0
   tmp=$(mktemp)
   awk '$0 == "# BEGIN SUF managed include" { skip = 1; next } $0 == "# END SUF managed include" { skip = 0; next } !skip { print }' "$SSH_MAIN" >"$tmp"
   install -m 600 -o root -g root "$tmp" "$SSH_MAIN"

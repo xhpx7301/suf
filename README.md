@@ -247,6 +247,7 @@ sudo bash ./uninstall.sh
 - Docker 发布端口必须使用 UFW 菜单中的“仅允许指定 IP/CIDR 访问端口”重新配置；仅添加 `ufw allow from ...` 不足以限制 Docker 转发流量。IPv4 和 IPv6 需要分别配置。使用 `iptables-nft` 后端时，应通过 `nft list chain ip filter DOCKER-USER`（或 `ip6 filter`）复核，而不是只看 `iptables -S`；Docker 重启后也应复核或重新执行该操作。
 - 如果只配置了 IPv4 白名单，SUF 会对同一 Docker 端口的 IPv6 转发默认拒绝；如确实需要 IPv6 访问，请再单独添加 IPv6 白名单。
 - Docker 来源限制会保存到 `/etc/suf/docker-source-rules.conf`；通过 SUF 菜单重新加载或启用 UFW 后，脚本会自动恢复 `DOCKER-USER` 跳转和限制规则。
+- 如果前面还有 Caddy、Nginx 或其他反向代理，后端防火墙看到的来源是代理服务器 IP，而不是最终访客 IP。要限制最终访客，必须在反向代理层配置客户端 IP 白名单；仅限制 Docker 后端端口无法阻止访客通过代理域名访问。
 - 默认 root 密钥直登能减少权限操作障碍，但私钥泄露会直接导致最高权限失陷，必须设置私钥口令并妥善备份。
 - SUF 使用 `PermitRootLogin prohibit-password`，不会使用允许 root 密码登录的 `PermitRootLogin yes`。
 - 启用、关闭或卸载防火墙，停止或卸载 Fail2ban 等操作都需要确认输入 `y`；直接回车会取消操作。
