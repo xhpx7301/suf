@@ -355,8 +355,7 @@ show_authorized_keys() {
 remove_authorized_key() {
   local target_user auth_file entries choice selected_line selected_key_type selected_key_body
   local line key_type key_body comment fingerprint index=0
-  read -r -p "从哪个用户删除公钥 [root]：" target_user
-  target_user=${target_user:-root}
+  target_user=root
   id "$target_user" >/dev/null 2>&1 || die "账号 ${target_user} 不存在。"
   auth_file=$(authorized_key_file "$target_user")
   [[ -f $auth_file ]] || die "账号 ${target_user} 没有 authorized_keys 文件。"
