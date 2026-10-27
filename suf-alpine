@@ -192,8 +192,7 @@ authorized_key_entries() {
 
 show_authorized_keys() {
   local target_user auth_file line key_type key_body comment fingerprint index=0
-  read -r -p "查看哪个用户的公钥 [root]：" target_user
-  target_user=${target_user:-root}
+  target_user=root
   id "$target_user" >/dev/null 2>&1 || die "账号 ${target_user} 不存在。"
   auth_file=$(authorized_key_file "$target_user")
   printf '\n账号：%s\n公钥文件：%s\n' "$target_user" "$auth_file"
