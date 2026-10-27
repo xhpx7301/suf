@@ -257,6 +257,21 @@ ensure_admin_user() {
   fi
 }
 
+ensure_unprivileged_user() {
+  local target_user=$1
+  [[ $target_user =~ ^[a-z_][a-z0-9_-]*$ ]] || die "用户名格式无效。"
+  [[ $target_user != root ]] || die "普通用户模式不能使用 root。"
+  if id "$target_user" >/dev/null 2>&1; then
+    if user_has_sudo "$target_user"; then
+      die "账号 ${target_user} 已属于 sudo/wheel 管理组，请选择其他账号或管理员模式。"
+    fi
+  else
+    info "创建普通账号 ${target_user}，不会加入 sudo/wheel 管理组。"
+    adduser "$target_user"
+  fi
+  return 0
+}
+
 validate_public_key() {
   local key=$1 tmp
   [[ $key != *$'\n'* ]] || return 1
@@ -271,12 +286,24 @@ validate_public_key() {
 }
 
 install_public_key() {
-  local target_user home ssh_dir auth_file public_key key_type key_body fingerprint
+  local target_user home ssh_dir auth_file public_key key_type key_body fingerprint access_mode
 
-  printf '\n默认给 root 安装公钥，可直接获得完整管理权限；输入其他用户名则创建普通 sudo 管理员。\n'
-  read -r -p "密钥登录用户名 [root]：" target_user
-  target_user=${target_user:-root}
-  ensure_admin_user "$target_user"
+  printf '\n选择该密钥登录账号的权限：\n（1）管理员权限（root 或 sudo）\n（2）普通用户（无 sudo）\n'
+  read -r -p "请选择 [1]：" access_mode
+  access_mode=${access_mode:-1}
+  case "$access_mode" in
+    1)
+      read -r -p "管理员登录用户名 [root]：" target_user
+      target_user=${target_user:-root}
+      ensure_admin_user "$target_user"
+      ;;
+    2)
+      read -r -p "普通登录用户名（不能是 root）：" target_user
+      [[ -n $target_user ]] || die "普通用户模式必须指定用户名。"
+      ensure_unprivileged_user "$target_user"
+      ;;
+    *) die "权限选项无效。" ;;
+  esac
 
   home=$(user_home "$target_user")
   [[ -n $home && -d $home ]] || die "找不到 ${target_user} 的家目录。"
@@ -319,8 +346,10 @@ install_public_key() {
   printf '  ssh -p %s %s@服务器IP\n' "$(current_ssh_port)" "$target_user"
   if [[ $target_user == root ]]; then
     printf '登录后执行 whoami，输出必须是 root。\n'
-  else
+  elif user_has_sudo "$target_user"; then
     printf '登录后执行 sudo -v，确认该用户可以提权。\n'
+  else
+    printf '登录后执行 whoami，确认输出是 %s；该账号没有 sudo 权限。\n' "$target_user"
   fi
 }
 
@@ -534,16 +563,15 @@ authorized_key_count() {
 require_tested_key_login() {
   local target_user=$1 count
   id "$target_user" >/dev/null 2>&1 || die "账号 ${target_user} 不存在。"
-  if [[ $target_user != root ]]; then
-    user_has_sudo "$target_user" || die "账号 ${target_user} 没有 sudo 权限。"
-  fi
   count=$(authorized_key_count "$target_user")
   ((count > 0)) || die "账号 ${target_user} 没有有效的 Ed25519 authorized_keys。"
 
   if [[ $target_user == root ]]; then
     warn "只有在第二个终端已用 root 密钥登录，并确认 whoami 输出 root 后才能继续。"
-  else
+  elif user_has_sudo "$target_user"; then
     warn "只有在第二个终端已用 ${target_user} 的密钥登录并成功执行 sudo -v 后才能继续。"
+  else
+    warn "只有在第二个终端已用 ${target_user} 的密钥登录，并确认 whoami 输出 ${target_user} 后才能继续。"
   fi
   confirm "确认已完成上述测试吗？" || die "未确认测试，取消 SSH 加固。"
 }
