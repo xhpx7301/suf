@@ -288,7 +288,9 @@ remove_authorized_key() {
   [[ $choice =~ ^[0-9]+$ ]] || die "编号无效。"
   ((choice >= 1 && choice <= index)) || die "编号超出范围。"
   IFS=$'\t' read -r target_user auth_file selected_line selected_key_type selected_key_body _ < <(printf '%s\n' "$entries" | sed -n "$choice"p)
-  (( $(authorized_key_count "$auth_file") > 1 )) || die "账号 $target_user 只剩最后一把有效公钥，不能删除。"
+  if (( $(authorized_key_count "$auth_file") <= 1 )); then
+    warn "账号 $target_user 只剩这一把有效公钥；删除后将无法通过 SSH 密钥登录该账号。"
+  fi
   fingerprint=$(printf '%s %s\n' "$selected_key_type" "$selected_key_body" | ssh-keygen -lf - | awk '{print $2}')
   warn "将从账号 $target_user（$auth_file）删除公钥 $fingerprint。"
   confirm "确认删除吗？" || die "取消删除公钥。"
