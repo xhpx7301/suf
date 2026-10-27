@@ -238,6 +238,23 @@ user_has_sudo() {
   id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|wheel'
 }
 
+set_local_account_password() {
+  local target_user=$1 password confirmation
+  while true; do
+    read -r -s -p "请设置本地提权密码：" password
+    printf '\n'
+    [[ -n $password ]] || { warn "密码不能为空。"; continue; }
+    [[ $password != *:* ]] || { warn "密码不能包含冒号，请重新设置。"; unset password; continue; }
+    read -r -s -p "请再次输入本地密码：" confirmation
+    printf '\n'
+    [[ $password == "$confirmation" ]] && break
+    warn "两次输入不一致，请重新设置。"
+  done
+  printf '%s:%s\n' "$target_user" "$password" | chpasswd || die "设置账号本地密码失败。"
+  unset password confirmation
+  ok "本地提权密码已设置。"
+}
+
 ensure_admin_user() {
   local target_user=$1
 
@@ -247,8 +264,9 @@ ensure_admin_user() {
   fi
 
   if ! id "$target_user" >/dev/null 2>&1; then
-    info "创建运维账号 ${target_user}。请为 sudo 设置一个强本地密码。"
-    adduser "$target_user"
+    info "创建管理员账号。"
+    adduser --disabled-password --gecos "" --quiet "$target_user"
+    set_local_account_password "$target_user"
   fi
 
   if ! user_has_sudo "$target_user"; then
@@ -293,7 +311,6 @@ install_public_key() {
   access_mode=${access_mode:-1}
   case "$access_mode" in
     1)
-      printf '管理员账号说明：新建的非 root sudo 用户需要设置本地 sudo 密码；这不是 SSH 密钥口令。\n'
       read -r -p "管理员登录用户名 [root]：" target_user
       target_user=${target_user:-root}
       ensure_admin_user "$target_user"

@@ -203,7 +203,7 @@ ssh-keygen -t ed25519 -a 100 -f ~/.ssh/id_ed25519_suf_ai
 
 按提示给私钥设置强口令。Windows 可用 `Get-Content "$env:USERPROFILE\.ssh\id_ed25519_suf_ai.pub" | Set-Clipboard` 复制公钥；macOS/Linux 可用 `cat ~/.ssh/id_ed25519_suf_ai.pub` 查看公钥。将 `id_ed25519_suf_ai.pub` 的完整内容粘贴到 SUF。没有 `.pub` 后缀的 `id_ed25519_suf_ai` 是私钥，不能上传服务器、GitHub 或聊天工具。
 
-管理员模式下，新建的非 root sudo/doas 账号还需要设置本地账号密码供提权使用；这个密码与 SSH 私钥口令不同。选择无管理员权限的普通账号时，SUF 会创建无系统密码账号。
+管理员模式下，新建的非 root sudo/doas 账号会由 SUF 使用中文提示设置本地提权密码；这个密码与 SSH 私钥口令不同。选择无管理员权限的普通账号时，SUF 会创建无系统密码账号。
 
 1. 进入 SSH 菜单添加 Ed25519 公钥，选择管理员账号或无管理员权限的普通账号。
 2. 保持原 SSH 会话，在第二个终端测试对应账号的密钥登录，并确认 `whoami` 输出为该账号名。

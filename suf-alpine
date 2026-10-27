@@ -72,6 +72,23 @@ apk_install() {
 user_home() { getent passwd "$1" | cut -d: -f6; }
 user_is_admin() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx 'wheel'; }
 
+set_local_account_password() {
+  local target=$1 password confirmation
+  while true; do
+    read -r -s -p "请设置本地提权密码：" password
+    printf '\n'
+    [[ -n $password ]] || { warn "密码不能为空。"; continue; }
+    [[ $password != *:* ]] || { warn "密码不能包含冒号，请重新设置。"; unset password; continue; }
+    read -r -s -p "请再次输入本地密码：" confirmation
+    printf '\n'
+    [[ $password == "$confirmation" ]] && break
+    warn "两次输入不一致，请重新设置。"
+  done
+  printf '%s:%s\n' "$target" "$password" | chpasswd || die "设置账号本地密码失败。"
+  unset password confirmation
+  ok "本地提权密码已设置。"
+}
+
 ensure_openssh() {
   apk_install openssh
   command -v sshd >/dev/null 2>&1 || die "未找到 sshd。"
@@ -120,7 +137,9 @@ ensure_admin_user() {
   [[ $target =~ ^[a-z_][a-z0-9_-]*$ ]] || die "用户名格式无效。"
   if [[ $target == root ]]; then return; fi
   if ! id "$target" >/dev/null 2>&1; then
+    info "创建管理员账号。"
     adduser -D "$target"
+    set_local_account_password "$target"
   fi
   addgroup "$target" wheel >/dev/null 2>&1 || true
   apk_install doas
@@ -168,7 +187,6 @@ install_public_key() {
   access_mode=${access_mode:-1}
   case "$access_mode" in
     1)
-      printf '管理员账号说明：新建的非 root doas 用户需要设置本地账号密码；这不是 SSH 密钥口令。\n'
       read -r -p "管理员登录用户名 [root]：" target_user
       target_user=${target_user:-root}
       ensure_admin_user "$target_user"
