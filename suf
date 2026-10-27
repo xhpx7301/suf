@@ -388,45 +388,49 @@ authorized_key_entries() {
   awk '{for(i=1;i<NF;i++) if($i ~ /^(ssh-ed25519|sk-ssh-ed25519@openssh.com)$/ && $(i+1)!="") {comment=""; for(j=i+2;j<=NF;j++) comment=comment (comment ? " " : "") $j; printf "%d\t%s\t%s\t%s\n", NR,$i,$(i+1),comment; break}}' "$auth_file"
 }
 
+all_authorized_key_entries() {
+  local target_user passwd uid gid gecos home shell auth_file line key_type key_body comment
+  while IFS=: read -r target_user passwd uid gid gecos home shell; do
+    [[ -n $target_user && -n $home ]] || continue
+    auth_file="${home}/.ssh/authorized_keys"
+    [[ -r $auth_file ]] || continue
+    while IFS=$'\t' read -r line key_type key_body comment; do
+      [[ -n $key_type ]] || continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$target_user" "$auth_file" "$line" "$key_type" "$key_body" "$comment"
+    done < <(authorized_key_entries "$auth_file")
+  done < <(getent passwd)
+}
+
 show_authorized_keys() {
   local target_user auth_file line key_type key_body comment fingerprint index=0
-  target_user=root
-  id "$target_user" >/dev/null 2>&1 || die "账号 ${target_user} 不存在。"
-  auth_file=$(authorized_key_file "$target_user")
-  printf '\n账号：%s\n公钥文件：%s\n' "$target_user" "$auth_file"
-  while IFS=$'\t' read -r line key_type key_body comment; do
-    [[ -n $key_type ]] || continue
+  printf '\n所有账号的已安装公钥：\n'
+  while IFS=$'\t' read -r target_user auth_file line key_type key_body comment; do
     fingerprint=$(printf '%s %s\n' "$key_type" "$key_body" | ssh-keygen -lf - | awk '{print $2}')
     index=$((index + 1))
-    printf '  [%d] %s  %s\n' "$index" "$fingerprint" "${comment:--}"
-  done < <(authorized_key_entries "$auth_file")
+    printf '  [%d] 用户：%s  %s  %s\n' "$index" "$target_user" "$fingerprint" "${comment:--}"
+  done < <(all_authorized_key_entries)
   ((index > 0)) || printf '  没有有效的 Ed25519 公钥。\n'
 }
 
 remove_authorized_key() {
   local target_user auth_file entries choice selected_line selected_key_type selected_key_body
   local line key_type key_body comment fingerprint index=0
-  target_user=root
-  id "$target_user" >/dev/null 2>&1 || die "账号 ${target_user} 不存在。"
-  auth_file=$(authorized_key_file "$target_user")
-  [[ -f $auth_file ]] || die "账号 ${target_user} 没有 authorized_keys 文件。"
-  (( $(authorized_key_count "$target_user") > 1 )) || die "不能删除最后一把有效公钥，请先添加另一把可用公钥。"
-  entries=$(authorized_key_entries "$auth_file")
-  [[ -n $entries ]] || die "账号 ${target_user} 没有有效的 Ed25519 公钥。"
-  printf '\n账号：%s\n' "$target_user"
-  while IFS=$'\t' read -r line key_type key_body comment; do
-    [[ -n $key_type ]] || continue
+  entries=$(all_authorized_key_entries)
+  [[ -n $entries ]] || die "没有找到有效的 Ed25519 公钥。"
+  printf '\n所有账号的已安装公钥：\n'
+  while IFS=$'\t' read -r target_user auth_file line key_type key_body comment; do
     fingerprint=$(printf '%s %s\n' "$key_type" "$key_body" | ssh-keygen -lf - | awk '{print $2}')
     index=$((index + 1))
-    printf '  [%d] %s  %s\n' "$index" "$fingerprint" "${comment:--}"
+    printf '  [%d] 用户：%s  %s  %s\n' "$index" "$target_user" "$fingerprint" "${comment:--}"
   done <<<"$entries"
   read -r -p "输入要删除的编号（直接回车取消）：" choice
   [[ -n $choice ]] || die "取消删除公钥。"
   [[ $choice =~ ^[0-9]+$ ]] || die "编号无效。"
   ((choice >= 1 && choice <= index)) || die "编号超出范围。"
-  IFS=$'\t' read -r selected_line selected_key_type selected_key_body _ < <(printf '%s\n' "$entries" | sed -n "${choice}p")
+  IFS=$'\t' read -r target_user auth_file selected_line selected_key_type selected_key_body _ < <(printf '%s\n' "$entries" | sed -n "${choice}p")
+  (( $(authorized_key_count "$target_user") > 1 )) || die "账号 ${target_user} 只剩最后一把有效公钥，不能删除。"
   fingerprint=$(printf '%s %s\n' "$selected_key_type" "$selected_key_body" | ssh-keygen -lf - | awk '{print $2}')
-  warn "将从 ${auth_file} 删除公钥 ${fingerprint}。"
+  warn "将从账号 ${target_user}（${auth_file}）删除公钥 ${fingerprint}。"
   confirm "确认删除吗？" || die "取消删除公钥。"
   sed -i "${selected_line}d" "$auth_file"
   chown "$target_user:$target_user" "$auth_file"
