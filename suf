@@ -327,7 +327,7 @@ install_public_key() {
   [[ -n $home && -d $home ]] || die "找不到 ${target_user} 的家目录。"
 
   printf '\n请在本地电脑生成 Ed25519 密钥（已有密钥可跳过）：\n'
-  printf '  Windows PowerShell：ssh-keygen -t ed25519 -a 100 -f "\$env:USERPROFILE\.ssh\id_ed25519_suf_ai"\n'
+  printf '  Windows PowerShell：ssh-keygen -t ed25519 -a 100 -f "$env:USERPROFILE\.ssh\id_ed25519_suf_ai"\n'
   printf '  macOS/Linux：      ssh-keygen -t ed25519 -a 100 -f ~/.ssh/id_ed25519_suf_ai\n'
   printf '按提示设置私钥口令；公钥文件是 id_ed25519_suf_ai.pub。\n'
   printf '  Windows 复制公钥：Get-Content "$env:USERPROFILE\.ssh\id_ed25519_suf_ai.pub" | Set-Clipboard\n'
