@@ -1922,24 +1922,24 @@ menu() {
     cat <<EOF
 SUF ${APP_VERSION} - Server UFW & SSH Fortress (Debian/Ubuntu)
 
-（1）SSH 与密钥管理       [$(ssh_status_badge)]
-（2）UFW 防火墙管理       [$(ufw_status_badge)]
-（3）Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
-（4）查看整体安全状态
-（5）安全初始化向导
-（6）更新 SUF 项目
+（1）更新 SUF 项目
+（2）SSH 与密钥管理       [$(ssh_status_badge)]
+（3）UFW 防火墙管理       [$(ufw_status_badge)]
+（4）Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
+（5）查看整体安全状态
+（6）安全初始化向导
 （7）卸载 SUF 并按备份恢复设置
 （0）退出
 EOF
     printf '\n'
     read -r -p "请选择服务领域：" choice
     case "${choice:-}" in
-      1) ssh_menu ;;
-      2) ufw_menu ;;
-      3) fail2ban_menu ;;
-      4) run_menu_action show_status ;;
-      5) run_menu_action security_initialization_wizard ;;
-      6) run_menu_action update_suf_project ;;
+      1) run_menu_action update_suf_project ;;
+      2) ssh_menu ;;
+      3) ufw_menu ;;
+      4) fail2ban_menu ;;
+      5) run_menu_action show_status ;;
+      6) run_menu_action security_initialization_wizard ;;
       7)
         if [[ -x /usr/local/sbin/suf-uninstall ]]; then
           if /usr/local/sbin/suf-uninstall --restore; then exit 0; fi

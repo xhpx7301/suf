@@ -998,24 +998,24 @@ menu() {
     cat <<EOF
 SUF ${APP_VERSION} - Alpine 服务器安全管理
 
-（1）SSH 与密钥管理       [$(ssh_status_badge)]
-（2）nftables 防火墙管理  [$(nftables_status_badge)]
-（3）Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
-（4）查看整体安全状态
-（5）安全初始化向导
-（6）更新 SUF 项目
+（1）更新 SUF 项目
+（2）SSH 与密钥管理       [$(ssh_status_badge)]
+（3）nftables 防火墙管理  [$(nftables_status_badge)]
+（4）Fail2ban 防暴力破解  [$(fail2ban_status_badge)]
+（5）查看整体安全状态
+（6）安全初始化向导
 （7）查看运行服务与监听端口
 （0）退出
 EOF
     printf '\n'
     read -r -p "请选择服务领域：" choice
     case ${choice:-} in
-      1) ssh_menu ;;
-      2) firewall_menu ;;
-      3) fail2ban_menu ;;
-      4) run_menu_action show_status ;;
-      5) run_menu_action security_initialization_wizard ;;
-      6) run_menu_action update_project ;;
+      1) run_menu_action update_project ;;
+      2) ssh_menu ;;
+      3) firewall_menu ;;
+      4) fail2ban_menu ;;
+      5) run_menu_action show_status ;;
+      6) run_menu_action security_initialization_wizard ;;
       7) run_menu_action show_runtime_status ;;
       0) exit 0 ;;
       *) warn "无效选项。"; pause ;;
