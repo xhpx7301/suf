@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.19"
+APP_VERSION="1.2.20"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -1499,7 +1499,10 @@ ufw_find_added_rule_for_number() {
   [[ -n $line ]] || return 1
 
   entry=$line
-  entry=${entry#*] }
+  # UFW 对齐编号和列之间可能包含多个空格；先移除编号并规范空白，
+  # 避免多余空格导致 action 被解析为空，从而误报“未找到编号规则”。
+  entry=$(printf '%s\n' "$entry" |
+    sed -E 's/^\[[[:space:]]*[0-9]+[[:space:]]*\][[:space:]]+//; s/[[:space:]]+/ /g')
   target=${entry%% *}
   if [[ $entry == "$target (v6)"* ]]; then
     entry=${entry#"$target (v6) "}
