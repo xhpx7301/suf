@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.9"
+APP_VERSION="1.2.10"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -1101,7 +1101,7 @@ show_listening_ports() {
     return
   }
   [[ -n $candidates ]] || return
-  confirm "要从上述公网监听端口中选择一个加入 UFW 放行规则吗？" || return
+  info "可直接输入上述公网监听端口加入 UFW 放行规则；直接回车结束。"
 
   while true; do
     read -r -p "输入要放行的端口号（直接回车结束）：" port || return 0
@@ -2165,7 +2165,7 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （7）删除编号规则（无真实编号时使用临时编号）
 （8）重新加载规则
 （9）查看 UFW 已放行端口
-（10）查看实际监听端口并按需放行
+（10）查看实际监听端口并直接放行
 （11）放行指定端口
 （12）仅允许指定 IP/CIDR 访问端口
 （13）为端口添加连接限速
