@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.10"
+APP_VERSION="1.2.11"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -205,14 +205,14 @@ prompt_protocol() {
 }
 
 prompt_ufw_allow_protocols() {
-  local selection
+  local default_selection=${1:-1} selection
   while true; do
-    read -r -p "放行协议：1=TCP+UDP，2=仅 TCP，3=仅 UDP [1]：" selection
-    case "${selection:-1}" in
+    read -r -p "放行协议：1=TCP+UDP，2=仅 TCP，3=仅 UDP [${default_selection}]：" selection
+    case "${selection:-$default_selection}" in
       1) printf 'tcp udp\n'; return ;;
       2) printf 'tcp\n'; return ;;
       3) printf 'udp\n'; return ;;
-      *) warn "请选择 1、2 或 3；直接按 Enter 默认为 TCP+UDP。" ;;
+      *) warn "请选择 1、2 或 3；直接按 Enter 使用默认选项。" ;;
     esac
   done
 }
@@ -1078,7 +1078,7 @@ is_public_listening_port() {
 }
 
 show_listening_ports() {
-  local candidates port protocols protocol comment
+  local candidates port protocols protocol comment default_selection
   printf '以下是实际监听端口，不代表已被 UFW 放行：\n\n'
   if command -v ss >/dev/null 2>&1; then
     candidates=$(public_listening_candidates || true)
@@ -1111,7 +1111,17 @@ show_listening_ports() {
       continue
     fi
     port=$((10#$port))
-    protocols=$(prompt_ufw_allow_protocols)
+    if is_public_listening_port "$port" tcp && is_public_listening_port "$port" udp; then
+      default_selection=1
+    elif is_public_listening_port "$port" tcp; then
+      default_selection=2
+    elif is_public_listening_port "$port" udp; then
+      default_selection=3
+    else
+      warn "未检测到 ${port} 的公网 TCP/UDP 监听；仅本机监听的服务不能通过此菜单开放。"
+      continue
+    fi
+    protocols=$(prompt_ufw_allow_protocols "$default_selection")
 
     for protocol in $protocols; do
       if ! is_public_listening_port "$port" "$protocol"; then
