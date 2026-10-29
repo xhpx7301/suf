@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.16"
+APP_VERSION="1.2.17"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -998,7 +998,7 @@ show_ufw_rules() {
   if ufw_is_active; then
     active=1
   else
-    warn "UFW 当前未启用，以上没有系统真实编号；选项 7 会显示临时编号，选项 14 也可按端口删除已保存规则。"
+    warn "UFW 当前未启用，以上没有系统真实编号；选项 7 会显示临时编号，选项 15 也可按端口删除已保存规则。"
   fi
   if ((active)); then
     printf '\n已应用的底层 UFW 规则命令：\n'
@@ -1479,6 +1479,92 @@ ufw_delete_numbered_rule() {
   confirm "确认删除规则 ${number} 吗？" || die "取消删除。"
   ufw --force delete "$((10#$number))" || die "删除规则编号 ${number} 失败；规则可能已被其他会话修改。"
   ok "已删除规则编号 ${number}。"
+  show_ufw_rules
+}
+
+ufw_find_added_rule_for_number() {
+  local number=$1 line entry target action source port protocol added_line
+  require_ufw
+  line=$(ufw status numbered 2>/dev/null | awk -v wanted="$((10#$number))" '
+    {
+      entry=$0
+      if (entry ~ /^\[[[:space:]]*[0-9]+\][[:space:]]+/) {
+        number_text=entry
+        sub(/^\[[[:space:]]*/, "", number_text)
+        sub(/[[:space:]]*\].*$/, "", number_text)
+        if ((number_text + 0) == wanted) print entry
+      }
+    }
+  ' | sed -n '1p')
+  [[ -n $line ]] || return 1
+
+  entry=$line
+  entry=${entry#*] }
+  target=${entry%% *}
+  if [[ $entry == "$target (v6)"* ]]; then
+    entry=${entry#"$target (v6) "}
+  else
+    entry=${entry#"$target "}
+  fi
+  action=${entry%% *}
+  entry=${entry#"$action "}
+  entry=${entry#"IN "}
+  source=${entry%% *}
+  action=${action,,}
+
+  while IFS= read -r added_line; do
+    if [[ $source == Anywhere* ]]; then
+      [[ $added_line =~ ^ufw[[:space:]]${action}[[:space:]]${target}([[:space:]]|$) ]] && {
+        printf '%s\n' "$added_line"
+        return 0
+      }
+    else
+      port=${target%%/*}
+      protocol=${target##*/}
+      [[ $added_line == "ufw ${action} from ${source} to any port ${port} proto ${protocol}"* ]] && {
+        printf '%s\n' "$added_line"
+        return 0
+      }
+    fi
+  done < <(ufw show added 2>/dev/null || true)
+  return 1
+}
+
+ufw_update_numbered_rule_comment() {
+  local number selected comment default_comment='受 SUF 管理的服务' rule_without_comment
+  local -a added_rules=() rule_parts=()
+  require_ufw
+  show_ufw_rules
+
+  if ufw status numbered 2>/dev/null | grep -Eq '^\[[[:space:]]*[0-9]+\][[:space:]]+'; then
+    read -r -p "要修改备注的 UFW 规则编号：" number
+    [[ $number =~ ^[0-9]+$ ]] && ((10#$number > 0)) || die "规则编号无效。"
+    selected=$(ufw_find_added_rule_for_number "$number") ||
+      die "未找到编号 ${number} 对应的已保存规则。"
+  else
+    mapfile -t added_rules < <(ufw_show_added_sorted)
+    ((${#added_rules[@]} > 0)) || die "当前没有可修改备注的 UFW 规则。"
+    printf 'UFW 未启用，以下为本次显示的临时编号：\n'
+    for ((number = 0; number < ${#added_rules[@]}; number++)); do
+      printf '[%d] %s\n' "$((number + 1))" "${added_rules[number]}"
+    done
+    read -r -p "要修改备注的临时编号：" number
+    [[ $number =~ ^[0-9]+$ ]] && ((10#$number >= 1 && 10#$number <= ${#added_rules[@]})) ||
+      die "临时编号无效。"
+    selected=${added_rules[$((10#$number - 1))]}
+  fi
+
+  if [[ $selected =~ comment[[:space:]]\'(.*)\'$ ]]; then
+    default_comment=${BASH_REMATCH[1]}
+  fi
+  comment=$(prompt_ufw_comment "$default_comment")
+  rule_without_comment=${selected%% comment *}
+  read -r -a rule_parts <<< "$rule_without_comment"
+  [[ ${#rule_parts[@]} -ge 3 && ${rule_parts[0]} == ufw ]] ||
+    die "无法解析 UFW 规则：${selected}"
+  ufw_delete_saved_rule_command "$selected"
+  ufw "${rule_parts[@]:1}" comment "$comment"
+  ok "已更新规则编号 ${number} 的备注：${comment}。"
   show_ufw_rules
 }
 
@@ -2110,6 +2196,7 @@ menu_action_label() {
     ufw_allow_source_to_port) printf '限制端口访问来源' ;;
     ufw_limit_port) printf '限制端口新连接' ;;
     ufw_delete_port_rules) printf '按端口删除 UFW 规则' ;;
+    ufw_update_numbered_rule_comment) printf '按编号修改 UFW 规则备注' ;;
     ufw_update_port_comment) printf '修改端口备注' ;;
     show_fail2ban_status) printf '查看 Fail2ban 状态' ;;
     install_fail2ban_service) printf '安装 Fail2ban' ;;
@@ -2236,8 +2323,9 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （11）放行指定端口
 （12）仅允许指定 IP/CIDR 访问端口
 （13）为端口添加连接限速
-（14）按端口删除已放行规则（支持 UFW 未启用）
-（15）修改端口备注（同时修改 TCP/UDP）
+（14）按编号规则修改备注
+（15）按端口删除已放行规则（支持 UFW 未启用）
+（16）修改端口备注（同时修改 TCP/UDP）
 （0）返回一级菜单
 EOF
     printf '\n'
@@ -2256,8 +2344,9 @@ EOF
       11) run_repeatable_menu_action ufw_allow_port ;;
       12) run_repeatable_menu_action ufw_allow_source_to_port ;;
       13) run_repeatable_menu_action ufw_limit_port ;;
-      14) run_repeatable_menu_action ufw_delete_port_rules ;;
-      15) run_repeatable_menu_action ufw_update_port_comment ;;
+      14) run_repeatable_menu_action ufw_update_numbered_rule_comment ;;
+      15) run_repeatable_menu_action ufw_delete_port_rules ;;
+      16) run_repeatable_menu_action ufw_update_port_comment ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
