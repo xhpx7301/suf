@@ -914,6 +914,9 @@ show_ufw_rules() {
   require_ufw
   printf 'UFW 规则（按编号）\n'
   ufw_status_numbered_sorted | translate_ufw_output
+  if ! ufw_is_active; then
+    warn "UFW 当前未启用，系统不会提供可删除的规则编号；请使用选项 14 按端口删除已保存规则。"
+  fi
   printf '\n待应用的底层 UFW 规则命令：\n'
   ufw_show_added_sorted || true
 }
