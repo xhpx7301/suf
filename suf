@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.11"
+APP_VERSION="1.2.12"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -851,7 +851,7 @@ configure_ufw() {
   allow_extra_ufw_ports
 
   warn "启用后，未明确放行的入站端口将被阻止。"
-  ufw show added || true
+  ufw_show_added_sorted || true
   confirm "确认以上规则完整，可以启用 UFW 吗？" || die "UFW 尚未启用。"
   ufw --force enable
   ok "UFW 已启用。当前和目标 SSH 端口均已放行，旧规则不会被脚本自动删除。"
@@ -920,10 +920,47 @@ translate_ufw_output() {
   done
 }
 
+ufw_status_verbose_sorted() {
+  local line
+  local -a headers=() rules=()
+  while IFS= read -r line; do
+    if [[ $line =~ ^[[:space:]]*[^[:space:]]+[[:space:]]+(\(v6\)[[:space:]]+)?(ALLOW|DENY|REJECT|LIMIT)([[:space:]]|$) ]]; then
+      rules+=("$line")
+    else
+      headers+=("$line")
+    fi
+  done < <(ufw status verbose 2>/dev/null || true)
+
+  printf '%s\n' "${headers[@]}"
+  if ((${#rules[@]} > 0)); then
+    printf '%s\n' "${rules[@]}" |
+      awk '
+        {
+          target=$0
+          sub(/^[[:space:]]+/, "", target)
+          sub(/[[:space:]].*$/, "", target)
+          port=target
+          sub(/\/.*/, "", port)
+          sub(/,.*/, "", port)
+          sub(/:.*/, "", port)
+          if (port !~ /^[0-9]+$/) port=999999
+          proto=target
+          sub(/^[^\/]*\//, "", proto)
+          sub(/[^[:alpha:]].*/, "", proto)
+          proto_rank=(proto == "tcp" ? 1 : proto == "udp" ? 2 : 9)
+          v6=($0 ~ / \(v6\)/ ? 1 : 0)
+          printf "%010d\t%d\t%d\t%06d\t%s\n", port + 0, proto_rank, v6, NR, $0
+        }
+      ' |
+      sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4n |
+      cut -f5-
+  fi
+}
+
 show_ufw_status() {
   if command -v ufw >/dev/null 2>&1; then
     printf 'UFW 防火墙状态\n'
-    ufw status verbose | translate_ufw_output
+    ufw_status_verbose_sorted | translate_ufw_output
   else
     printf 'UFW：未安装\n'
   fi
@@ -1168,7 +1205,7 @@ remove_broad_ufw_allows() {
   fi
 
   warn "检测到 ${port}/${protocol} 仍有对所有来源开放的规则。"
-  ufw show added || true
+  ufw_show_added_sorted || true
   confirm "删除这些广泛放行规则，使 IP 限制真正生效吗？" || die "已保留广泛规则，因此不能称为仅允许指定 IP。"
 
   for action in "${broad_actions[@]}"; do
@@ -1550,7 +1587,7 @@ enable_ufw_service() {
 
   warn "UFW 启用后，未明确放行的入站端口将被阻止。"
   warn "云安全组不受 UFW 控制；Docker 发布端口也需要单独审核。"
-  ufw show added || true
+  ufw_show_added_sorted || true
   confirm "确认以上规则完整，可以启用 UFW 吗？" || die "未启用 UFW。"
   ufw --force enable
   restore_docker_firewall_rules
@@ -2017,7 +2054,7 @@ security_initialization_wizard() {
   fi
   allow_extra_ufw_ports
   warn "启用后，未明确放行的入站端口将被阻止。"
-  ufw show added || true
+  ufw_show_added_sorted || true
   confirm "确认以上规则完整，可以启用 UFW 吗？" || die "取消操作。"
   ufw --force enable
 
