@@ -945,45 +945,6 @@ ufw_sort_status_rule_lines() {
     cut -f4-
 }
 
-ufw_sort_numbered_rule_lines() {
-  local display_offset=$1
-  shift
-  (($# > 0)) || return 0
-  printf '%s\n' "$@" |
-    awk -v offset="$display_offset" '
-      {
-        target=$0
-        sub(/^\[[^]]+\][[:space:]]+/, "", target)
-        sub(/^[[:space:]]+/, "", target)
-        sort_target=target
-        sub(/[[:space:]].*$/, "", sort_target)
-        port=sort_target
-        sub(/\/.*/, "", port)
-        sub(/,.*/, "", port)
-        sub(/:.*/, "", port)
-        if (port !~ /^[0-9]+$/) port=999999
-        proto=sort_target
-        sub(/^[^\/]*\//, "", proto)
-        sub(/[^[:alpha:]].*/, "", proto)
-        proto_rank=(proto == "tcp" ? 1 : proto == "udp" ? 2 : 9)
-        v6=($0 ~ / \(v6\)/ ? 1 : 0)
-        printf "%010d\t%d\t%d\t%06d\t%s\n", port + 0, proto_rank, v6, NR, $0
-      }
-    ' |
-    sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4n |
-    cut -f5- |
-    awk -v offset="$display_offset" '
-      {
-        actual=$0
-        sub(/^\[[[:space:]]*/, "", actual)
-        sub(/[[:space:]]*\].*$/, "", actual)
-        rest=$0
-        sub(/^\[[^]]+\]/, "", rest)
-        printf "[显示 %d | UFW %s]%s\n", NR + offset, actual, rest
-      }
-    '
-}
-
 ufw_status_verbose_sorted() {
   local line
   local -a headers=() ipv4_rules=() ipv6_rules=()
@@ -1023,7 +984,6 @@ show_ufw_rules() {
   local active=0
   require_ufw
   printf 'UFW 规则（按编号）\n'
-  printf '显示按端口排序；删除时请使用每行中的 UFW 真实编号。\n'
   ufw_status_numbered_sorted | translate_ufw_output
   if ufw_is_active; then
     active=1
@@ -1056,11 +1016,11 @@ ufw_status_numbered_sorted() {
   printf '%s\n' "${headers[@]}"
   if ((${#ipv4_rules[@]} > 0)); then
     printf 'IPv4 规则：\n'
-    ufw_sort_numbered_rule_lines 0 "${ipv4_rules[@]}"
+    ufw_sort_status_rule_lines "${ipv4_rules[@]}"
   fi
   if ((${#ipv6_rules[@]} > 0)); then
     printf 'IPv6 规则：\n'
-    ufw_sort_numbered_rule_lines "${#ipv4_rules[@]}" "${ipv6_rules[@]}"
+    ufw_sort_status_rule_lines "${ipv6_rules[@]}"
   fi
 }
 
@@ -1500,10 +1460,10 @@ ufw_delete_numbered_rule() {
     show_ufw_rules
     return
   fi
-  read -r -p "要删除的 UFW 真实编号：" number
+  read -r -p "要删除的规则编号：" number
   [[ $number =~ ^[0-9]+$ ]] && ((10#$number > 0)) || die "规则编号无效。"
   if ! ufw status numbered 2>/dev/null | grep -Eq "^\[[[:space:]]*$((10#$number))[[:space:]]*\]"; then
-    die "未找到 UFW 真实编号 ${number}；请使用上方显示项中的 UFW 编号。"
+    die "未找到规则编号 ${number}；请使用上方方括号中的实际编号。"
   fi
   warn "删除后其他规则编号会变化。"
   confirm "确认删除规则 ${number} 吗？" || die "取消删除。"
