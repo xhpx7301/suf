@@ -1400,7 +1400,7 @@ ufw_delete_port_rules() {
 }
 
 ufw_update_port_comment() {
-  local port protocol comment default_comment='' line
+  local port protocol comment default_comment='' line attempts
   local -a protocols_present=()
   require_ufw
 
@@ -1426,7 +1426,12 @@ ufw_update_port_comment() {
 
   for protocol in tcp udp; do
     if printf '%s\n' "${protocols_present[@]}" | grep -qx "$protocol"; then
-      ufw --force delete allow "${port}/${protocol}" || die "删除旧的 ${port}/${protocol} 规则失败。"
+      attempts=0
+      while ufw show added | grep -Eq "^ufw allow ${port}/${protocol}([[:space:]]|$)"; do
+        ((attempts += 1))
+        ((attempts <= 20)) || die "${port}/${protocol} 规则过多，请通过编号规则菜单人工处理。"
+        ufw --force delete allow "${port}/${protocol}" || die "删除旧的 ${port}/${protocol} 规则失败。"
+      done
       ufw allow "${port}/${protocol}" comment "$comment"
     fi
   done
