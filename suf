@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.6"
+APP_VERSION="1.2.7"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -1353,6 +1353,9 @@ ufw_delete_numbered_rule() {
   local number
   require_ufw
   show_ufw_rules
+  if ! ufw status numbered 2>/dev/null | grep -Eq '^\[[[:space:]]*[0-9]+\][[:space:]]+'; then
+    die "当前 UFW 未启用或没有编号规则；请使用选项 14 按端口删除已保存规则。"
+  fi
   read -r -p "要删除的规则编号：" number
   [[ $number =~ ^[0-9]+$ ]] && ((10#$number > 0)) || die "规则编号无效。"
   if ! ufw status numbered 2>/dev/null | grep -Eq "^\[[[:space:]]*$((10#$number))[[:space:]]*\]"; then
@@ -1366,8 +1369,8 @@ ufw_delete_numbered_rule() {
 }
 
 ufw_delete_port_rules() {
-  local port protocols protocol number
-  local -a numbers=()
+  local port protocols protocol number line rule_without_comment
+  local -a numbers=() added_rules=() rule_parts=()
   require_ufw
 
   printf '请选择要删除的已放行或限速端口：\n'
@@ -1376,7 +1379,7 @@ ufw_delete_port_rules() {
   port=$(prompt_port 443 "要删除规则的端口")
   protocols=$(prompt_ufw_allow_protocols)
 
-  # A single UFW rule normally creates adjacent IPv4 and IPv6 entries.  Capture
+  # A single UFW rule normally creates adjacent IPv4 and IPv6 entries. Capture
   # their current numbers first, then delete in reverse so renumbering is harmless.
   for protocol in $protocols; do
     while IFS= read -r number; do
@@ -1385,17 +1388,44 @@ ufw_delete_port_rules() {
       ufw status numbered | sed -nE "s/^\\[[[:space:]]*([0-9]+)\\][[:space:]]+${port}\\/${protocol}( \\(v6\\))?([[:space:]].*)?$/\\1/p"
     )
   done
-  ((${#numbers[@]} > 0)) || die "未找到 ${port} 的 UFW 规则。"
-  mapfile -t numbers < <(printf '%s\n' "${numbers[@]}" | sort -rn -u)
+  if ((${#numbers[@]} > 0)); then
+    mapfile -t numbers < <(printf '%s\n' "${numbers[@]}" | sort -rn -u)
+    printf '将删除端口 %s 的以下规则编号：%s\n' "$port" "${numbers[*]}"
+    warn "这会同时删除所选协议的 IPv4 和 IPv6 规则；删除后其他规则编号会变化。"
+    confirm "确认删除这些规则吗？请输入 y 执行删除" || die "取消删除。"
 
-  printf '将删除端口 %s 的以下规则编号：%s\n' "$port" "${numbers[*]}"
-  warn "这会同时删除所选协议的 IPv4 和 IPv6 规则；删除后其他规则编号会变化。"
-  confirm "确认删除这些规则吗？请输入 y 执行删除" || die "取消删除。"
+    for number in "${numbers[@]}"; do
+      ufw --force delete "$number" || die "删除规则编号 ${number} 失败；规则可能已被其他会话修改。"
+    done
+    ok "已删除端口 ${port} 的 ${#numbers[@]} 条规则。"
+  else
+    # When UFW is inactive, `ufw status numbered` has no numbered entries even
+    # though `ufw show added` still contains the saved rules. Delete those rules
+    # by their saved command instead of trying to delete nonexistent numbers.
+    while IFS= read -r line; do
+      for protocol in $protocols; do
+        if [[ $line =~ ^ufw[[:space:]](allow|limit)[[:space:]]${port}/${protocol}([[:space:]]|$) ]] ||
+           [[ $line =~ ^ufw[[:space:]]allow[[:space:]]from[[:space:]].*[[:space:]]to[[:space:]]any[[:space:]]port[[:space:]]${port}[[:space:]]proto[[:space:]]${protocol}([[:space:]]|$) ]]; then
+          added_rules+=("$line")
+          break
+        fi
+      done
+    done < <(ufw show added 2>/dev/null || true)
 
-  for number in "${numbers[@]}"; do
-    ufw --force delete "$number" || die "删除规则编号 ${number} 失败；规则可能已被其他会话修改。"
-  done
-  ok "已删除端口 ${port} 的 ${#numbers[@]} 条规则。"
+    ((${#added_rules[@]} > 0)) || die "未找到端口 ${port} 的 UFW 规则。"
+    printf 'UFW 当前未启用，将删除端口 %s 的以下已保存规则：\n' "$port"
+    printf '  %s\n' "${added_rules[@]}"
+    confirm "确认删除这些已保存规则吗？请输入 y 执行删除" || die "取消删除。"
+
+    for line in "${added_rules[@]}"; do
+      rule_without_comment=${line%% comment *}
+      read -r -a rule_parts <<< "$rule_without_comment"
+      [[ ${#rule_parts[@]} -ge 3 && ${rule_parts[0]} == ufw ]] ||
+        die "无法解析 UFW 规则：${line}"
+      ufw --force delete "${rule_parts[@]:1}" || die "删除已保存规则失败：${line}"
+    done
+    ok "已删除端口 ${port} 的 ${#added_rules[@]} 条已保存规则。"
+  fi
   show_ufw_rules
 }
 
@@ -2066,14 +2096,14 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （4）关闭 UFW
 （5）卸载 UFW（保留配置）
 （6）查看编号规则
-（7）删除编号规则
+（7）删除编号规则（UFW 启用后）
 （8）重新加载规则
 （9）查看 UFW 已放行端口
 （10）查看实际监听端口并按需放行
 （11）放行指定端口
 （12）仅允许指定 IP/CIDR 访问端口
 （13）为端口添加连接限速
-（14）按端口删除已放行规则（IPv4/IPv6）
+（14）按端口删除已放行规则（支持 UFW 未启用）
 （15）修改端口备注（同时修改 TCP/UDP）
 （0）返回一级菜单
 EOF
