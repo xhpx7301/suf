@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.17"
+APP_VERSION="1.2.18"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -998,7 +998,7 @@ show_ufw_rules() {
   if ufw_is_active; then
     active=1
   else
-    warn "UFW 当前未启用，以上没有系统真实编号；选项 7 会显示临时编号，选项 15 也可按端口删除已保存规则。"
+    warn "UFW 当前未启用，以上没有系统真实编号；选项 7 会显示临时编号，选项 14 也可按端口删除已保存规则。"
   fi
   if ((active)); then
     printf '\n已应用的底层 UFW 规则命令：\n'
@@ -2323,8 +2323,8 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （11）放行指定端口
 （12）仅允许指定 IP/CIDR 访问端口
 （13）为端口添加连接限速
-（14）按编号规则修改备注
-（15）按端口删除已放行规则（支持 UFW 未启用）
+（14）按端口删除已放行规则（支持 UFW 未启用）
+（15）按编号规则修改备注
 （16）修改端口备注（同时修改 TCP/UDP）
 （0）返回一级菜单
 EOF
@@ -2344,8 +2344,8 @@ EOF
       11) run_repeatable_menu_action ufw_allow_port ;;
       12) run_repeatable_menu_action ufw_allow_source_to_port ;;
       13) run_repeatable_menu_action ufw_limit_port ;;
-      14) run_repeatable_menu_action ufw_update_numbered_rule_comment ;;
-      15) run_repeatable_menu_action ufw_delete_port_rules ;;
+      14) run_repeatable_menu_action ufw_delete_port_rules ;;
+      15) run_repeatable_menu_action ufw_update_numbered_rule_comment ;;
       16) run_repeatable_menu_action ufw_update_port_comment ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
