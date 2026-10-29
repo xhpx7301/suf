@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.12"
+APP_VERSION="1.2.13"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -920,40 +920,54 @@ translate_ufw_output() {
   done
 }
 
+ufw_sort_status_rule_lines() {
+  (($# > 0)) || return 0
+  printf '%s\n' "$@" |
+    awk '
+      {
+        target=$0
+        sub(/^\[[^]]+\][[:space:]]+/, "", target)
+        sub(/^[[:space:]]+/, "", target)
+        sub(/[[:space:]].*$/, "", target)
+        port=target
+        sub(/\/.*/, "", port)
+        sub(/,.*/, "", port)
+        sub(/:.*/, "", port)
+        if (port !~ /^[0-9]+$/) port=999999
+        proto=target
+        sub(/^[^\/]*\//, "", proto)
+        sub(/[^[:alpha:]].*/, "", proto)
+        proto_rank=(proto == "tcp" ? 1 : proto == "udp" ? 2 : 9)
+        printf "%010d\t%d\t%06d\t%s\n", port + 0, proto_rank, NR, $0
+      }
+    ' |
+    sort -t $'\t' -k1,1n -k2,2n -k3,3n |
+    cut -f4-
+}
+
 ufw_status_verbose_sorted() {
   local line
-  local -a headers=() rules=()
+  local -a headers=() ipv4_rules=() ipv6_rules=()
   while IFS= read -r line; do
     if [[ $line =~ ^[[:space:]]*[^[:space:]]+[[:space:]]+(\(v6\)[[:space:]]+)?(ALLOW|DENY|REJECT|LIMIT)([[:space:]]|$) ]]; then
-      rules+=("$line")
+      if [[ $line == *" (v6)"* ]]; then
+        ipv6_rules+=("$line")
+      else
+        ipv4_rules+=("$line")
+      fi
     else
       headers+=("$line")
     fi
   done < <(ufw status verbose 2>/dev/null || true)
 
   printf '%s\n' "${headers[@]}"
-  if ((${#rules[@]} > 0)); then
-    printf '%s\n' "${rules[@]}" |
-      awk '
-        {
-          target=$0
-          sub(/^[[:space:]]+/, "", target)
-          sub(/[[:space:]].*$/, "", target)
-          port=target
-          sub(/\/.*/, "", port)
-          sub(/,.*/, "", port)
-          sub(/:.*/, "", port)
-          if (port !~ /^[0-9]+$/) port=999999
-          proto=target
-          sub(/^[^\/]*\//, "", proto)
-          sub(/[^[:alpha:]].*/, "", proto)
-          proto_rank=(proto == "tcp" ? 1 : proto == "udp" ? 2 : 9)
-          v6=($0 ~ / \(v6\)/ ? 1 : 0)
-          printf "%010d\t%d\t%d\t%06d\t%s\n", port + 0, proto_rank, v6, NR, $0
-        }
-      ' |
-      sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4n |
-      cut -f5-
+  if ((${#ipv4_rules[@]} > 0)); then
+    printf 'IPv4 规则：\n'
+    ufw_sort_status_rule_lines "${ipv4_rules[@]}"
+  fi
+  if ((${#ipv6_rules[@]} > 0)); then
+    printf 'IPv6 规则：\n'
+    ufw_sort_status_rule_lines "${ipv6_rules[@]}"
   fi
 }
 
@@ -971,7 +985,7 @@ show_ufw_rules() {
   printf 'UFW 规则（按编号）\n'
   ufw_status_numbered_sorted | translate_ufw_output
   if ! ufw_is_active; then
-    warn "UFW 当前未启用，系统不会提供可删除的规则编号；请使用选项 14 按端口删除已保存规则。"
+    warn "UFW 当前未启用，以上没有系统真实编号；选项 7 会显示临时编号，选项 14 也可按端口删除已保存规则。"
   fi
   printf '\n待应用的底层 UFW 规则命令：\n'
   ufw_show_added_sorted || true
@@ -979,38 +993,27 @@ show_ufw_rules() {
 
 ufw_status_numbered_sorted() {
   local line
-  local -a headers=() rules=()
+  local -a headers=() ipv4_rules=() ipv6_rules=()
   while IFS= read -r line; do
     if [[ $line =~ ^\[[[:space:]]*[0-9]+\][[:space:]]+ ]]; then
-      rules+=("$line")
+      if [[ $line == *" (v6)"* ]]; then
+        ipv6_rules+=("$line")
+      else
+        ipv4_rules+=("$line")
+      fi
     else
       headers+=("$line")
     fi
   done < <(ufw status numbered 2>/dev/null || true)
 
   printf '%s\n' "${headers[@]}"
-  if ((${#rules[@]} > 0)); then
-    printf '%s\n' "${rules[@]}" |
-      awk '
-        {
-          target=$0
-          sub(/^\[[^]]+\][[:space:]]+/, "", target)
-          sub(/[[:space:]].*$/, "", target)
-          port=target
-          sub(/\/.*/, "", port)
-          sub(/,.*/, "", port)
-          sub(/:.*/, "", port)
-          if (port !~ /^[0-9]+$/) port=999999
-          proto=target
-          sub(/^[^\/]*\//, "", proto)
-          sub(/[^[:alpha:]].*/, "", proto)
-          proto_rank=(proto == "tcp" ? 1 : proto == "udp" ? 2 : 9)
-          v6=($0 ~ / \(v6\)/ ? 1 : 0)
-          printf "%010d\t%d\t%d\t%06d\t%s\n", port + 0, proto_rank, v6, NR, $0
-        }
-      ' |
-      sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4n |
-      cut -f5-
+  if ((${#ipv4_rules[@]} > 0)); then
+    printf 'IPv4 规则：\n'
+    ufw_sort_status_rule_lines "${ipv4_rules[@]}"
+  fi
+  if ((${#ipv6_rules[@]} > 0)); then
+    printf 'IPv6 规则：\n'
+    ufw_sort_status_rule_lines "${ipv6_rules[@]}"
   fi
 }
 
