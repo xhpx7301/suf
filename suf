@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.7"
+APP_VERSION="1.2.8"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -2072,6 +2072,29 @@ run_menu_action() {
   pause
 }
 
+run_repeatable_menu_action() {
+  local action=$1 status
+  shift
+  while true; do
+    set +e
+    (
+      set -Eeuo pipefail
+      "$action" "$@"
+    )
+    status=$?
+    set -e
+    if ((status != 0)); then
+      explain_menu_failure "$action" "$status"
+      pause
+      return
+    fi
+    if ! confirm "继续执行$(menu_action_label "$action")吗？"; then
+      pause
+      return
+    fi
+  done
+}
+
 ssh_menu() {
   while true; do
     clear 2>/dev/null || true
@@ -2140,15 +2163,15 @@ EOF
       4) run_menu_action disable_ufw_service ;;
       5) run_menu_action uninstall_ufw_service ;;
       6) run_menu_action show_ufw_rules ;;
-      7) run_menu_action ufw_delete_numbered_rule ;;
+      7) run_repeatable_menu_action ufw_delete_numbered_rule ;;
       8) run_menu_action reload_ufw_service ;;
       9) run_menu_action show_ufw_allowed_ports ;;
       10) run_menu_action show_listening_ports ;;
-      11) run_menu_action ufw_allow_port ;;
-      12) run_menu_action ufw_allow_source_to_port ;;
-      13) run_menu_action ufw_limit_port ;;
-      14) run_menu_action ufw_delete_port_rules ;;
-      15) run_menu_action ufw_update_port_comment ;;
+      11) run_repeatable_menu_action ufw_allow_port ;;
+      12) run_repeatable_menu_action ufw_allow_source_to_port ;;
+      13) run_repeatable_menu_action ufw_limit_port ;;
+      14) run_repeatable_menu_action ufw_delete_port_rules ;;
+      15) run_repeatable_menu_action ufw_update_port_comment ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
