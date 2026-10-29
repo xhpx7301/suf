@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.5"
+APP_VERSION="1.2.6"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -202,6 +202,25 @@ prompt_protocol() {
       *) warn "协议只能是 tcp 或 udp。" ;;
     esac
   done
+}
+
+prompt_ufw_allow_protocols() {
+  local selection
+  while true; do
+    read -r -p "放行协议：1=TCP+UDP，2=仅 TCP，3=仅 UDP [1]：" selection
+    case "${selection:-1}" in
+      1) printf 'tcp udp\n'; return ;;
+      2) printf 'tcp\n'; return ;;
+      3) printf 'udp\n'; return ;;
+      *) warn "请选择 1、2 或 3；直接按 Enter 默认为 TCP+UDP。" ;;
+    esac
+  done
+}
+
+prompt_ufw_comment() {
+  local default_comment=$1 comment
+  read -r -p "备注 [${default_comment}]：" comment
+  printf '%s\n' "${comment:-$default_comment}"
 }
 
 prompt_positive_integer() {
@@ -894,9 +913,89 @@ show_ufw_status() {
 show_ufw_rules() {
   require_ufw
   printf 'UFW 规则（按编号）\n'
-  ufw status numbered | translate_ufw_output
+  ufw_status_numbered_sorted | translate_ufw_output
   printf '\n待应用的底层 UFW 规则命令：\n'
-  ufw show added || true
+  ufw_show_added_sorted || true
+}
+
+ufw_status_numbered_sorted() {
+  local line
+  local -a headers=() rules=()
+  while IFS= read -r line; do
+    if [[ $line =~ ^\[[[:space:]]*[0-9]+\][[:space:]]+ ]]; then
+      rules+=("$line")
+    else
+      headers+=("$line")
+    fi
+  done < <(ufw status numbered 2>/dev/null || true)
+
+  printf '%s\n' "${headers[@]}"
+  if ((${#rules[@]} > 0)); then
+    printf '%s\n' "${rules[@]}" |
+      awk '
+        {
+          target=$0
+          sub(/^\[[^]]+\][[:space:]]+/, "", target)
+          sub(/[[:space:]].*$/, "", target)
+          port=target
+          sub(/\/.*/, "", port)
+          sub(/,.*/, "", port)
+          sub(/:.*/, "", port)
+          if (port !~ /^[0-9]+$/) port=999999
+          proto=target
+          sub(/^[^\/]*\//, "", proto)
+          sub(/[^[:alpha:]].*/, "", proto)
+          proto_rank=(proto == "tcp" ? 1 : proto == "udp" ? 2 : 9)
+          v6=($0 ~ / \(v6\)/ ? 1 : 0)
+          printf "%010d\t%d\t%d\t%06d\t%s\n", port + 0, proto_rank, v6, NR, $0
+        }
+      ' |
+      sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4n |
+      cut -f5-
+  fi
+}
+
+ufw_show_added_sorted() {
+  local line
+  local -a rules=()
+  while IFS= read -r line; do
+    case "$line" in
+      'ufw allow '*|'ufw limit '*) rules+=("$line") ;;
+    esac
+  done < <(ufw show added 2>/dev/null || true)
+
+  ((${#rules[@]} > 0)) || return 0
+  printf '%s\n' "${rules[@]}" |
+    awk '
+      {
+        target=$0
+        sub(/^ufw (allow|limit) /, "", target)
+        marker=" to any port "
+        pos=index(target, marker)
+        if (pos > 0) {
+          target=substr(target, pos + length(marker))
+          sub(/[[:space:]].*$/, "", target)
+          proto_line=$0
+          sub(/^.*[[:space:]]proto[[:space:]]+/, "", proto_line)
+          sub(/[[:space:]].*$/, "", proto_line)
+          proto=proto_line
+        } else {
+          sub(/[[:space:]].*$/, "", target)
+          proto=target
+          sub(/^[^\/]*\//, "", proto)
+          sub(/[^[:alpha:]].*/, "", proto)
+        }
+        port=target
+        sub(/\/.*/, "", port)
+        sub(/,.*/, "", port)
+        sub(/:.*/, "", port)
+        if (port !~ /^[0-9]+$/) port=999999
+        proto_rank=(proto == "tcp" ? 1 : proto == "udp" ? 2 : 9)
+        printf "%010d\t%d\t%06d\t%s\n", port + 0, proto_rank, NR, $0
+      }
+    ' |
+    sort -t $'\t' -k1,1n -k2,2n -k3,3n |
+    cut -f4-
 }
 
 show_ufw_allowed_ports() {
@@ -926,7 +1025,7 @@ show_ufw_allowed_ports() {
         found=1
         ;;
     esac
-  done < <(ufw show added 2>/dev/null || true)
+  done < <(ufw_show_added_sorted)
 
   ((found)) || printf '  没有保存的放行或连接限速规则。\n'
 }
@@ -957,7 +1056,7 @@ is_public_listening_port() {
 }
 
 show_listening_ports() {
-  local candidates port protocol
+  local candidates port protocols protocol comment
   printf '以下是实际监听端口，不代表已被 UFW 放行：\n\n'
   if command -v ss >/dev/null 2>&1; then
     candidates=$(public_listening_candidates || true)
@@ -990,18 +1089,25 @@ show_listening_ports() {
       continue
     fi
     port=$((10#$port))
-    protocol=$(prompt_protocol)
+    protocols=$(prompt_ufw_allow_protocols)
 
-    if ! is_public_listening_port "$port" "$protocol"; then
-      warn "未检测到 ${port}/${protocol} 的公网监听；仅本机监听的服务不能通过此菜单开放。"
-      continue
-    fi
-    if ufw show added | grep -Eq "^ufw (allow|limit) ${port}/${protocol}([[:space:]]|$)"; then
-      warn "已存在 ${port}/${protocol} 的广泛放行或限速规则，未重复添加。"
-    else
-      ufw allow "${port}/${protocol}" comment '从监听服务放行'
-      ok "已将正在监听的 ${port}/${protocol} 加入 UFW 放行规则。"
-    fi
+    for protocol in $protocols; do
+      if ! is_public_listening_port "$port" "$protocol"; then
+        warn "未检测到 ${port}/${protocol} 的公网监听；仅本机监听的服务不能通过此菜单开放。"
+        protocols=""
+        break
+      fi
+    done
+    [[ -n $protocols ]] || continue
+    comment=$(prompt_ufw_comment '从监听服务放行')
+    for protocol in $protocols; do
+      if ufw show added | grep -Eq "^ufw (allow|limit) ${port}/${protocol}([[:space:]]|$)"; then
+        warn "已存在 ${port}/${protocol} 的广泛放行或限速规则，未重复添加。"
+      else
+        ufw allow "${port}/${protocol}" comment "$comment"
+        ok "已将正在监听的 ${port}/${protocol} 加入 UFW 放行规则。"
+      fi
+    done
     printf '\n'
     show_ufw_allowed_ports
     printf '\n'
@@ -1009,12 +1115,15 @@ show_listening_ports() {
 }
 
 ufw_allow_port() {
-  local port protocol
+  local port protocols protocol comment
   require_ufw
   port=$(prompt_port 443 "要放行的端口")
-  protocol=$(prompt_protocol)
-  ufw allow "${port}/${protocol}" comment '受 SUF 管理的服务'
-  ok "已放行 ${port}/${protocol}。"
+  protocols=$(prompt_ufw_allow_protocols)
+  comment=$(prompt_ufw_comment '受 SUF 管理的服务')
+  for protocol in $protocols; do
+    ufw allow "${port}/${protocol}" comment "$comment"
+  done
+  ok "已放行端口 ${port} 的协议：${protocols}，备注：${comment}。"
 }
 
 remove_broad_ufw_allows() {
@@ -1246,14 +1355,18 @@ ufw_delete_numbered_rule() {
   show_ufw_rules
   read -r -p "要删除的规则编号：" number
   [[ $number =~ ^[0-9]+$ ]] && ((10#$number > 0)) || die "规则编号无效。"
+  if ! ufw status numbered 2>/dev/null | grep -Eq "^\[[[:space:]]*$((10#$number))[[:space:]]*\]"; then
+    die "未找到规则编号 ${number}；请使用上方方括号中的实际编号。"
+  fi
   warn "删除后其他规则编号会变化。"
   confirm "确认删除规则 ${number} 吗？" || die "取消删除。"
-  ufw --force delete "$((10#$number))"
+  ufw --force delete "$((10#$number))" || die "删除规则编号 ${number} 失败；规则可能已被其他会话修改。"
+  ok "已删除规则编号 ${number}。"
   show_ufw_rules
 }
 
 ufw_delete_port_rules() {
-  local port protocol index
+  local port protocols protocol number
   local -a numbers=()
   require_ufw
 
@@ -1261,24 +1374,64 @@ ufw_delete_port_rules() {
   show_ufw_allowed_ports
   printf '\n'
   port=$(prompt_port 443 "要删除规则的端口")
-  protocol=$(prompt_protocol)
+  protocols=$(prompt_ufw_allow_protocols)
 
   # A single UFW rule normally creates adjacent IPv4 and IPv6 entries.  Capture
   # their current numbers first, then delete in reverse so renumbering is harmless.
-  mapfile -t numbers < <(
-    ufw status numbered | sed -nE "s/^\\[[[:space:]]*([0-9]+)\\][[:space:]]+${port}\\/${protocol}( \\(v6\\))?([[:space:]].*)?$/\\1/p"
-  )
-  ((${#numbers[@]} > 0)) || die "未找到 ${port}/${protocol} 的 UFW 规则。"
+  for protocol in $protocols; do
+    while IFS= read -r number; do
+      [[ -n $number ]] && numbers+=("$number")
+    done < <(
+      ufw status numbered | sed -nE "s/^\\[[[:space:]]*([0-9]+)\\][[:space:]]+${port}\\/${protocol}( \\(v6\\))?([[:space:]].*)?$/\\1/p"
+    )
+  done
+  ((${#numbers[@]} > 0)) || die "未找到 ${port} 的 UFW 规则。"
+  mapfile -t numbers < <(printf '%s\n' "${numbers[@]}" | sort -rn -u)
 
-  printf '将删除 %s/%s 的以下规则编号：%s\n' "$port" "$protocol" "${numbers[*]}"
-  warn "这会同时删除匹配的 IPv4 和 IPv6 规则；删除后其他规则编号会变化。"
+  printf '将删除端口 %s 的以下规则编号：%s\n' "$port" "${numbers[*]}"
+  warn "这会同时删除所选协议的 IPv4 和 IPv6 规则；删除后其他规则编号会变化。"
   confirm "确认删除这些规则吗？请输入 y 执行删除" || die "取消删除。"
 
-  for ((index = ${#numbers[@]} - 1; index >= 0; index--)); do
-    ufw --force delete "${numbers[index]}"
+  for number in "${numbers[@]}"; do
+    ufw --force delete "$number" || die "删除规则编号 ${number} 失败；规则可能已被其他会话修改。"
   done
-  ok "已删除 ${port}/${protocol} 的 ${#numbers[@]} 条规则。"
+  ok "已删除端口 ${port} 的 ${#numbers[@]} 条规则。"
   show_ufw_rules
+}
+
+ufw_update_port_comment() {
+  local port protocol comment default_comment='' line
+  local -a protocols_present=()
+  require_ufw
+
+  printf '请选择要修改备注的已放行端口：\n'
+  show_ufw_allowed_ports
+  printf '\n'
+  port=$(prompt_port 443 "要修改备注的端口")
+
+  while IFS= read -r line; do
+    for protocol in tcp udp; do
+      if [[ $line =~ ^ufw[[:space:]]allow[[:space:]]${port}/${protocol}([[:space:]]|$) ]]; then
+        protocols_present+=("$protocol")
+        if [[ -z $default_comment && $line =~ comment[[:space:]]\'(.*)\'$ ]]; then
+          default_comment=${BASH_REMATCH[1]}
+        fi
+      fi
+    done
+  done < <(ufw_show_added_sorted)
+
+  ((${#protocols_present[@]} > 0)) || die "未找到端口 ${port} 的广泛放行规则。"
+  default_comment=${default_comment:-受 SUF 管理的服务}
+  comment=$(prompt_ufw_comment "$default_comment")
+
+  for protocol in tcp udp; do
+    if printf '%s\n' "${protocols_present[@]}" | grep -qx "$protocol"; then
+      ufw --force delete allow "${port}/${protocol}" || die "删除旧的 ${port}/${protocol} 规则失败。"
+      ufw allow "${port}/${protocol}" comment "$comment"
+    fi
+  done
+  ok "端口 ${port} 的 TCP/UDP 备注已更新为：${comment}。"
+  show_ufw_allowed_ports
 }
 
 ufw_is_active() {
@@ -1811,6 +1964,8 @@ menu_action_label() {
     ufw_allow_port) printf '放行指定端口' ;;
     ufw_allow_source_to_port) printf '限制端口访问来源' ;;
     ufw_limit_port) printf '限制端口新连接' ;;
+    ufw_delete_port_rules) printf '按端口删除 UFW 规则' ;;
+    ufw_update_port_comment) printf '修改端口备注' ;;
     show_fail2ban_status) printf '查看 Fail2ban 状态' ;;
     install_fail2ban_service) printf '安装 Fail2ban' ;;
     configure_fail2ban) printf '配置 SSH 防护' ;;
@@ -1914,6 +2069,7 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （12）仅允许指定 IP/CIDR 访问端口
 （13）为端口添加连接限速
 （14）按端口删除已放行规则（IPv4/IPv6）
+（15）修改端口备注（同时修改 TCP/UDP）
 （0）返回一级菜单
 EOF
     printf '\n'
@@ -1933,6 +2089,7 @@ EOF
       12) run_menu_action ufw_allow_source_to_port ;;
       13) run_menu_action ufw_limit_port ;;
       14) run_menu_action ufw_delete_port_rules ;;
+      15) run_menu_action ufw_update_port_comment ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
