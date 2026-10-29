@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.18"
+APP_VERSION="1.2.19"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -2197,7 +2197,7 @@ menu_action_label() {
     ufw_limit_port) printf '限制端口新连接' ;;
     ufw_delete_port_rules) printf '按端口删除 UFW 规则' ;;
     ufw_update_numbered_rule_comment) printf '按编号修改 UFW 规则备注' ;;
-    ufw_update_port_comment) printf '修改端口备注' ;;
+    ufw_update_port_comment) printf '按端口修改备注' ;;
     show_fail2ban_status) printf '查看 Fail2ban 状态' ;;
     install_fail2ban_service) printf '安装 Fail2ban' ;;
     configure_fail2ban) printf '配置 SSH 防护' ;;
@@ -2325,7 +2325,7 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （13）为端口添加连接限速
 （14）按端口删除已放行规则（支持 UFW 未启用）
 （15）按编号规则修改备注
-（16）修改端口备注（同时修改 TCP/UDP）
+（16）按端口修改备注（同时修改 TCP/UDP）
 （0）返回一级菜单
 EOF
     printf '\n'
