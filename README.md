@@ -108,7 +108,7 @@ suf --help          # 查看帮助
 ## 菜单结构
 
 ```text
-SUF 1.2.15 - Server UFW & SSH Fortress
+SUF 1.2.16 - Server UFW & SSH Fortress
 
 （1）更新 SUF 项目
 （2）SSH 与密钥管理

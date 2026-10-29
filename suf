@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.15"
+APP_VERSION="1.2.16"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -33,6 +33,16 @@ info() { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
 ok() { printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 die() { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+colored_status() {
+  local state=$1 color="$C_RESET"
+  case "$state" in
+    运行中|已启用|已安装) color=$C_GREEN ;;
+    已停止|已关闭|未启用) color=$C_YELLOW ;;
+    未安装|失败|异常*) color=$C_RED ;;
+  esac
+  printf '%s%s%s' "$color" "$state" "$C_RESET"
+}
 
 pause() {
   printf '\n'
@@ -890,8 +900,8 @@ translate_ufw_output() {
   local line
   while IFS= read -r line || [[ -n $line ]]; do
     case "$line" in
-      'Status: active') printf '状态：已启用\n'; continue ;;
-      'Status: inactive') printf '状态：未启用\n'; continue ;;
+      'Status: active') printf '状态：%s\n' "$(colored_status 已启用)"; continue ;;
+      'Status: inactive') printf '状态：%s\n' "$(colored_status 未启用)"; continue ;;
       To*Action*From) printf '目标                         操作          来源\n'; continue ;;
     esac
 
@@ -1965,32 +1975,32 @@ ssh_status_badge() {
   local service
   if service=$(find_ssh_service 2>/dev/null); then
     if systemctl is-active --quiet "$service"; then
-      printf '运行中'
+      colored_status 运行中
     else
-      printf '已停止'
+      colored_status 已停止
     fi
   else
-    printf '未安装'
+    colored_status 未安装
   fi
 }
 
 ufw_status_badge() {
   if ! command -v ufw >/dev/null 2>&1; then
-    printf '未安装'
+    colored_status 未安装
   elif ufw_is_active; then
-    printf '运行中'
+    colored_status 运行中
   else
-    printf '已关闭'
+    colored_status 已关闭
   fi
 }
 
 fail2ban_status_badge() {
   if ! command -v fail2ban-client >/dev/null 2>&1; then
-    printf '未安装'
+    colored_status 未安装
   elif systemctl is-active --quiet fail2ban; then
-    printf '运行中'
+    colored_status 运行中
   else
-    printf '已停止'
+    colored_status 已停止
   fi
 }
 
