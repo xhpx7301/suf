@@ -820,7 +820,7 @@ allow_extra_ufw_ports() {
   local input entry port proto
   printf '\n额外端口格式示例：8443/tcp,51820/udp。留空表示不添加。\n'
   read -r -p "需要额外放行的端口：" input
-  [[ -n $input ]] || return
+  [[ -n $input ]] || return 0
 
   IFS=',' read -r -a entries <<<"$input"
   for entry in "${entries[@]}"; do
