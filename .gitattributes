@@ -3,3 +3,4 @@
 .gitattributes text eol=lf
 *.sh text eol=lf
 suf text eol=lf
+suf-alpine text eol=lf

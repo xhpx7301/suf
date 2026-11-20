@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.3"
+APP_VERSION="1.2.21"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -13,6 +13,7 @@ FAIL2BAN_JAIL_DIR="/etc/fail2ban/jail.d"
 FAIL2BAN_JAIL_FILE="${FAIL2BAN_JAIL_DIR}/${APP_NAME}.local"
 NFT_CONF="/etc/nftables.d/${APP_NAME}.nft"
 NFT_MAIN="/etc/nftables.nft"
+NFT_RULES_FILE="/etc/${APP_NAME}/nftables-rules.conf"
 SSHD_BIN=""
 LAST_CONFIGURED_USER=""
 export LC_ALL=C
@@ -27,6 +28,15 @@ info() { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
 ok() { printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 die() { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+colored_status() {
+  local state=$1 color="$C_RESET"
+  case "$state" in
+    运行中|已启用|已安装) color=$C_GREEN ;;
+    已停止|已关闭|未启用) color=$C_YELLOW ;;
+    未安装|失败|启动失败|异常*) color=$C_RED ;;
+  esac
+  printf '%s%s%s' "$color" "$state" "$C_RESET"
+}
 pause() { printf '\n'; read -r -p "按 Enter 返回菜单..." _; }
 confirm() {
   local prompt=$1 answer
@@ -130,6 +140,230 @@ prompt_protocol() {
       *) warn "协议只能是 tcp 或 udp。" ;;
     esac
   done
+}
+
+prompt_allow_protocols() {
+  local default_selection=${1:-1} selection
+  while true; do
+    read -r -p "放行协议：1=TCP+UDP，2=仅 TCP，3=仅 UDP [${default_selection}]：" selection
+    case "${selection:-$default_selection}" in
+      1) printf 'tcp udp\n'; return ;;
+      2) printf 'tcp\n'; return ;;
+      3) printf 'udp\n'; return ;;
+      *) warn "请选择 1、2 或 3；直接按 Enter 使用默认选项。" ;;
+    esac
+  done
+}
+
+prompt_rule_comment() {
+  local default_comment=$1 comment cleaned
+  while true; do
+    if ! read -r -p "备注 [${default_comment}]：" comment; then
+      printf '\n' >&2
+      return 1
+    fi
+    comment=${comment:-$default_comment}
+    if [[ $comment == *'|'* || $comment == *'"'* || $comment == *'\'* ]]; then
+      warn '备注不能包含 |、" 或 \，请重新输入。'
+      continue
+    fi
+    cleaned=$(printf '%s' "$comment" | tr -d '\001-\037\177')
+    if [[ $cleaned != "$comment" ]]; then
+      warn '备注不能包含控制字符，请重新输入。'
+      continue
+    fi
+    if ((${#comment} > 96)); then
+      warn "备注过长（${#comment} 字节，最多 96 字节），请精简。"
+      continue
+    fi
+    printf '%s\n' "$comment"
+    return
+  done
+}
+
+prompt_positive_integer() {
+  local prompt=$1 default_value=$2 value
+  while true; do
+    read -r -p "${prompt} [${default_value}]：" value
+    value=${value:-$default_value}
+    if [[ $value =~ ^[0-9]+$ ]] && ((10#$value > 0)); then
+      printf '%s\n' "$((10#$value))"
+      return
+    fi
+    warn "请输入大于 0 的整数。"
+  done
+}
+
+prompt_duration() {
+  local prompt=$1 default_value=$2 value
+  while true; do
+    read -r -p "${prompt} [${default_value}]：" value
+    value=${value:-$default_value}
+    if [[ $value =~ ^([0-9]+)([smhdw]?)$ ]] && ((10#${BASH_REMATCH[1]} > 0)); then
+      printf '%s\n' "$value"
+      return
+    fi
+    warn "时间格式无效，可使用 600、10m、1h、1d 或 1w。"
+  done
+}
+
+valid_ip_or_cidr() {
+  local value=$1
+  awk -v input="$value" '
+    function valid_ipv4(ip,    parts, n, i) {
+      if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return 0
+      n = split(ip, parts, ".")
+      if (n != 4) return 0
+      for (i = 1; i <= 4; i++) {
+        if (parts[i] + 0 > 255) return 0
+      }
+      return 1
+    }
+    function valid_ipv6(ip,    halves, nh, left, right, nl, nr, i, groups, ng, tail) {
+      if (ip == "" || ip !~ /^[0-9A-Fa-f:.]+$/) return 0
+      if (index(ip, ":::") > 0) return 0
+      if (ip ~ /\./) {
+        tail = ip
+        sub(/^.*:/, "", tail)
+        if (!valid_ipv4(tail)) return 0
+        sub(/:[^:]*$/, ":0:0", ip)
+      }
+      if (index(ip, "::") > 0) {
+        nh = split(ip, halves, "::")
+        if (nh > 2) return 0
+        nl = (halves[1] == "" ? 0 : split(halves[1], left, ":"))
+        nr = (halves[2] == "" ? 0 : split(halves[2], right, ":"))
+        for (i = 1; i <= nl; i++) if (left[i] !~ /^[0-9A-Fa-f]{1,4}$/) return 0
+        for (i = 1; i <= nr; i++) if (right[i] !~ /^[0-9A-Fa-f]{1,4}$/) return 0
+        return (nl + nr < 8)
+      }
+      ng = split(ip, groups, ":")
+      if (ng != 8) return 0
+      for (i = 1; i <= ng; i++) if (groups[i] !~ /^[0-9A-Fa-f]{1,4}$/) return 0
+      return 1
+    }
+    BEGIN {
+      if (input == "") exit 1
+      n = split(input, segs, "/")
+      if (n > 2) exit 1
+      ip = segs[1]
+      has_prefix = (n == 2)
+      prefix = (has_prefix ? segs[2] : "")
+      if (has_prefix && prefix !~ /^[0-9]+$/) exit 1
+      if (ip ~ /:/) {
+        if (!valid_ipv6(ip)) exit 1
+        if (has_prefix && (prefix + 0 < 0 || prefix + 0 > 128)) exit 1
+        exit 0
+      }
+      if (!valid_ipv4(ip)) exit 1
+      if (has_prefix && (prefix + 0 < 0 || prefix + 0 > 32)) exit 1
+      exit 0
+    }
+  '
+}
+
+current_ssh_client_ip() {
+  local candidate=""
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    candidate=${SSH_CONNECTION%% *}
+  elif [[ -n ${SSH_CLIENT:-} ]]; then
+    candidate=${SSH_CLIENT%% *}
+  elif command -v who >/dev/null 2>&1; then
+    candidate=$(who -m 2>/dev/null | sed -nE 's/.*\(([^)]+)\)[[:space:]]*$/\1/p' | head -n 1 || true)
+  fi
+  candidate=${candidate#[}
+  candidate=${candidate%]}
+  candidate=${candidate%%\%*}
+  if [[ -n $candidate && $candidate =~ ^[0-9A-Fa-f:.]+$ ]] && [[ $candidate == *.* || $candidate == *:* ]]; then
+    printf '%s\n' "$candidate"
+  fi
+}
+
+ip_matches_source() {
+  local client_ip=$1 source=$2
+  [[ $source == any ]] && return 0
+  [[ $client_ip == "$source" ]] && return 0
+  awk -v client="$client_ip" -v src="$source" '
+    function hex_val(ch,    pos) {
+      pos = index("0123456789abcdef", tolower(ch))
+      return pos > 0 ? pos - 1 : -1
+    }
+    function expand_v4(ip,    p, n) {
+      n = split(ip, p, ".")
+      if (n != 4) return ""
+      return sprintf("%02x%02x%02x%02x", p[1] + 0, p[2] + 0, p[3] + 0, p[4] + 0)
+    }
+    function expand_v6(ip,    tail, v4h, halves, nh, left, right, nl, nr, i, out, g) {
+      if (ip ~ /\./) {
+        tail = ip
+        sub(/^.*:/, "", tail)
+        v4h = expand_v4(tail)
+        if (v4h == "") return ""
+        sub(/:[^:]*$/, ":" substr(v4h, 1, 4) ":" substr(v4h, 5, 4), ip)
+      }
+      if (index(ip, "::") > 0) {
+        nh = split(ip, halves, "::")
+        if (nh > 2) return ""
+        nl = (halves[1] == "" ? 0 : split(halves[1], left, ":"))
+        nr = (halves[2] == "" ? 0 : split(halves[2], right, ":"))
+        if (nl + nr >= 8) return ""
+        out = ""
+        for (i = 1; i <= nl; i++) out = out sprintf("%04x", strtonum_hex(left[i]))
+        for (i = 1; i <= 8 - nl - nr; i++) out = out "0000"
+        for (i = 1; i <= nr; i++) out = out sprintf("%04x", strtonum_hex(right[i]))
+        return out
+      }
+      g = split(ip, left, ":")
+      if (g != 8) return ""
+      out = ""
+      for (i = 1; i <= 8; i++) out = out sprintf("%04x", strtonum_hex(left[i]))
+      return out
+    }
+    function strtonum_hex(s,    i, v, c) {
+      v = 0
+      for (i = 1; i <= length(s); i++) {
+        c = hex_val(substr(s, i, 1))
+        if (c < 0) return -1
+        v = v * 16 + c
+      }
+      return v
+    }
+    function match_hex_prefix(a, b, prefix,    full, rem, mask, va, vb, i) {
+      if (a == "" || b == "" || length(a) != length(b)) return 0
+      full = int(prefix / 4)
+      rem = prefix % 4
+      if (full > 0 && substr(a, 1, full) != substr(b, 1, full)) return 0
+      if (rem == 0) return 1
+      va = hex_val(substr(a, full + 1, 1))
+      vb = hex_val(substr(b, full + 1, 1))
+      mask = (rem == 1 ? 8 : rem == 2 ? 12 : 14)
+      return (int(va / (16 - mask)) == int(vb / (16 - mask)))
+    }
+    BEGIN {
+      n = split(src, segs, "/")
+      sip = segs[1]
+      if (sip ~ /:/) {
+        prefix = (n == 2 ? segs[2] + 0 : 128)
+        sh = expand_v6(sip)
+        if (client ~ /:/) {
+          ch = expand_v6(client)
+        } else {
+          v4 = expand_v4(client)
+          ch = (v4 == "" ? "" : "00000000000000000000ffff" v4)
+        }
+        exit !match_hex_prefix(ch, sh, prefix)
+      } else {
+        prefix = (n == 2 ? segs[2] + 0 : 32)
+        sh = expand_v4(sip)
+        if (client ~ /^::[fF]{4}:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+          sub(/^::[fF]{4}:/, "", client)
+        }
+        if (client ~ /:/) exit 1
+        ch = expand_v4(client)
+        exit !match_hex_prefix(ch, sh, prefix)
+      }
+    }
+  '
 }
 
 ensure_admin_user() {
@@ -423,7 +657,7 @@ disable_foreign_ssh_port_directives() {
 reload_ssh() { "$SSHD_BIN" -t || return 1; rc-service sshd reload >/dev/null 2>&1 || rc-service sshd restart; }
 
 write_sshd_hardening() {
-  local port=$1 target=$2 backup_dir permit_root effective
+  local port=$1 target=$2 backup_dir permit_root effective expected effective_root
   permit_root=$([[ $target == root ]] && printf 'prohibit-password' || printf 'no')
   backup_dir=$(backup_ssh_config); mkdir -p "$SSH_DROPIN_DIR"; ensure_dropin_include_first
   cat >"$SSH_DROPIN" <<EOF
@@ -440,10 +674,50 @@ MaxAuthTries 3
 LoginGraceTime 30
 EOF
   chmod 600 "$SSH_DROPIN"; chown root:root "$SSH_DROPIN"
-  if ! "$SSHD_BIN" -t; then restore_ssh_backup "$backup_dir"; die "SSH 配置校验失败，已恢复原配置。"; fi
-  effective=$($SSHD_BIN -T -C "user=root,host=$(hostname),addr=127.0.0.1")
-  grep -qx "port ${port}" <<<"$effective" || { restore_ssh_backup "$backup_dir"; die "SSH 端口未生效，已恢复原配置。"; }
-  if ! reload_ssh; then restore_ssh_backup "$backup_dir"; reload_ssh || true; die "SSH 重载失败，已恢复原配置。"; fi
+  if ! "$SSHD_BIN" -t; then
+    warn "sshd 配置校验失败，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "旧配置恢复后仍无法通过校验，请保持当前会话并人工检查 ${SSH_MAIN}。"
+    die "没有应用任何 SSH 变更。"
+  fi
+  effective=$("$SSHD_BIN" -T -C "user=root,host=$(hostname),addr=127.0.0.1")
+  for expected in \
+    "port ${port}" \
+    "pubkeyauthentication yes" \
+    "passwordauthentication no" \
+    "kbdinteractiveauthentication no" \
+    "authenticationmethods publickey"; do
+    if ! grep -qx "$expected" <<<"$effective"; then
+      warn "最终 SSH 配置未生效：${expected}，正在自动恢复。"
+      restore_ssh_backup "$backup_dir"
+      "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
+      die "没有应用任何 SSH 变更。"
+    fi
+  done
+  effective_root=$(awk '$1 == "permitrootlogin" {print $2; exit}' <<<"$effective")
+  if [[ $target == root ]]; then
+    if [[ $effective_root != prohibit-password && $effective_root != without-password ]]; then
+      warn "Root 密钥登录策略未生效，正在自动恢复。"
+      restore_ssh_backup "$backup_dir"
+      "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
+      die "没有应用任何 SSH 变更。"
+    fi
+  elif [[ $effective_root != no ]]; then
+    warn "禁止 Root 登录的策略未生效，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
+    die "没有应用任何 SSH 变更。"
+  fi
+  if ! reload_ssh; then
+    restore_ssh_backup "$backup_dir"
+    reload_ssh || true
+    die "SSH 重载失败，已恢复原配置。"
+  fi
+  if [[ $target == root ]]; then
+    ok "SSH 已设置为 root 仅密钥登录，所有密码认证均已禁止。"
+  else
+    ok "SSH 已设置为 ${target} 仅密钥登录，Root 登录和所有密码认证均已禁止。"
+  fi
   info "SSH 配置备份：${backup_dir}"
 }
 
@@ -493,7 +767,7 @@ show_ssh_status() {
     return
   fi
 
-  if rc-service sshd status >/dev/null 2>&1; then service_state='运行中'; else service_state='已停止或启动失败'; fi
+  if rc-service sshd status >/dev/null 2>&1; then service_state='运行中'; else service_state='已停止'; fi
   config=$("$SSHD_BIN" -T 2>/dev/null) || die "无法读取 SSH 生效配置。"
   root_config=$("$SSHD_BIN" -T -C "user=root,host=$(hostname),addr=127.0.0.1" 2>/dev/null) || root_config=$config
   port=$(awk '$1 == "port" { ports = ports ? ports ", " $2 : $2 } END { print ports }' <<<"$config")
@@ -530,7 +804,7 @@ show_ssh_status() {
 
   printf 'SSH 服务状态\n'
   printf '  服务名称：sshd\n'
-  printf '  运行状态：%s\n' "$service_state"
+  printf '  运行状态：%s\n' "$(colored_status "$service_state")"
   printf '  监听端口：%s\n' "${port:-未知}"
   printf '  登录等待时间：%s 秒\n' "${login_grace:-未知}"
   printf '  最大认证尝试：%s 次\n' "${max_auth:-未知}"
@@ -579,7 +853,7 @@ restore_latest_ssh_backup() {
 }
 
 change_ssh_port() {
-  local current target active_ports foreign_directives
+  local current target active_ports foreign_directives snapshot
   ensure_openssh
   current=$(current_ssh_port)
   target=$(prompt_port "$DEFAULT_SSH_PORT" "新的 SSH 端口")
@@ -594,38 +868,187 @@ change_ssh_port() {
     warn "继续后将注释以上配置，仅保留 TCP/${target}。"
     confirm "确认仅保留新的 SSH 端口吗？" || die "取消操作。"
   fi
-  if command -v nft >/dev/null 2>&1 && nft_table_exists; then
-    if nft list chain inet suf input 2>/dev/null | grep -Eq "tcp dport ${target}([[:space:]]|$)"; then
-      info "nftables 已有 TCP/${target} 放行规则。"
+  if command -v nft >/dev/null 2>&1; then
+    nft_ensure_rules_file
+    if nft_rule_exists_any_source tcp "$target"; then
+      info "nftables 规则中已有 TCP/${target} 放行记录。"
     else
-      nft add rule inet suf input tcp dport "$target" accept comment "SUF SSH"
-      nft list table inet suf >"$NFT_CONF"
-      nft_persistence
-      ok "nftables 已放行 TCP/${target}，原 SSH 端口规则暂时保留。"
+      snapshot=$(mktemp)
+      cp -a "$NFT_RULES_FILE" "$snapshot"
+      nft_upsert_rule allow tcp "$target" any "SUF SSH 管理"
+      nft_validate_and_sync "$snapshot"
+      rm -f "$snapshot"
+      if nft_table_exists; then
+        ok "nftables 已放行 TCP/${target}，原 SSH 端口规则暂时保留。"
+      else
+        info "已将 TCP/${target} 写入待应用的 SUF nftables 规则（当前 nftables 未启用）。"
+      fi
     fi
   else
-    warn "未检测到正在生效的 SUF nftables 规则，脚本无法自动放行新端口。"
+    warn "尚未安装 nftables，脚本无法自动放行新端口。"
     confirm "仍要继续修改 SSH 端口吗？" || die "取消操作。"
   fi
   write_sshd_port "$target"
+  if [[ -f $FAIL2BAN_JAIL_FILE ]]; then
+    info "如已启用 Fail2ban，请在 Fail2ban 菜单选择“配置/修改 SSH 防护参数”同步新端口 ${target}。"
+  fi
+}
+
+pad_col() {
+  local str=$1 target_cols=$2
+  local stripped=${str//[ -~]/}
+  local ascii_count=$((${#str} - ${#stripped}))
+  local wide_count=$((${#stripped} / 3))
+  local cols=$((ascii_count + wide_count * 2))
+  printf '%s' "$str"
+  while ((cols < target_cols)); do
+    printf ' '
+    ((cols += 1))
+  done
 }
 
 nft_table_exists() { nft list table inet suf >/dev/null 2>&1; }
+
+nft_main_has_wildcard_include() {
+  [[ -f $NFT_MAIN ]] || return 1
+  grep -qE '^[[:space:]]*include[[:space:]]+".*nftables\.d/\*\.nft"' "$NFT_MAIN"
+}
+
 nft_persistence() {
-  install -d -m 755 /etc/nftables.d
+  install -d -m 755 "$(dirname "$NFT_CONF")"
   touch "$NFT_MAIN"
+  if nft_main_has_wildcard_include; then
+    return 0
+  fi
   grep -Fqx "include \"${NFT_CONF}\"" "$NFT_MAIN" || printf '\ninclude "%s"\n' "$NFT_CONF" >>"$NFT_MAIN"
 }
+
 nft_disable_persistence() {
+  rm -f "$NFT_CONF"
   [[ -f $NFT_MAIN ]] || return 0
-  local tmp; tmp=$(mktemp)
+  local tmp
+  tmp=$(mktemp)
   grep -Fvx "include \"${NFT_CONF}\"" "$NFT_MAIN" >"$tmp" || true
-  install -m 600 -o root -g root "$tmp" "$NFT_MAIN"; rm -f "$tmp"
+  install -m 600 -o root -g root "$tmp" "$NFT_MAIN"
+  rm -f "$tmp"
 }
-nft_write_base() {
-  local ssh_port=$1 extra=${2:-}
-  install -d -m 755 /etc/nftables.d
-  cat >"$NFT_CONF" <<EOF
+
+nft_sort_rules_file() {
+  [[ -f $NFT_RULES_FILE ]] || return 0
+  [[ -s $NFT_RULES_FILE ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk -F'|' '
+    NF >= 4 && ($1 == "allow" || $1 == "limit") && ($2 == "tcp" || $2 == "udp") && $3 ~ /^[0-9]+$/ && $4 != "" {
+      comment = $5
+      for (i = 6; i <= NF; i++) comment = comment " " $i
+      gsub(/["\\|]/, "", comment)
+      if (comment == "") comment = "受 SUF 管理的服务"
+      key = $1 "|" $2 "|" ($3 + 0) "|" $4
+      if (!(key in seen)) {
+        keys[++count] = key
+        seen[key] = 1
+      }
+      entry[key] = $1 "|" $2 "|" ($3 + 0) "|" $4 "|" comment
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        k = keys[i]
+        split(entry[k], f, "|")
+        proto_rank = (f[2] == "tcp" ? 1 : 2)
+        src_rank = (f[4] == "any" ? 1 : (f[4] ~ /:/ ? 3 : 2))
+        act_rank = (f[1] == "allow" ? 1 : 2)
+        printf "%010d|%d|%d|%s|%d|%s\n", f[3] + 0, proto_rank, src_rank, f[4], act_rank, entry[k]
+      }
+    }
+  ' "$NFT_RULES_FILE" |
+    sort -t '|' -k1,1n -k2,2n -k3,3n -k4,4 -k5,5n |
+    cut -d '|' -f6- >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$NFT_RULES_FILE"
+  rm -f "$tmp"
+}
+
+nft_migrate_legacy_rules() {
+  local raw=""
+  if nft_table_exists; then
+    raw=$(nft list table inet suf 2>/dev/null || true)
+  elif [[ -s $NFT_CONF ]]; then
+    raw=$(cat "$NFT_CONF" 2>/dev/null || true)
+  fi
+  [[ -n $raw ]] || return 0
+  awk '
+    /^[[:space:]]*(table|chain|type[[:space:]]+filter|\}|\{|iifname|ct[[:space:]]+state[[:space:]]+established|ip[[:space:]]+protocol[[:space:]]+icmp|ip6[[:space:]]+nexthdr[[:space:]]+icmpv6)/ { next }
+    {
+      line = $0
+      if (match(line, /(tcp|udp)[[:space:]]+dport[[:space:]]+[0-9]+/)) {
+        dp = substr(line, RSTART, RLENGTH)
+        split(dp, dp_parts, /[[:space:]]+/)
+        proto = dp_parts[1]
+        port = dp_parts[3]
+      } else {
+        next
+      }
+      action = (line ~ /limit[[:space:]]+rate/ ? "limit" : "allow")
+      src = "any"
+      if (match(line, /ip6?[[:space:]]+saddr[[:space:]]+[^[:space:]]+/)) {
+        sa = substr(line, RSTART, RLENGTH)
+        split(sa, sa_parts, /[[:space:]]+/)
+        src = sa_parts[3]
+      }
+      comment = "已迁移规则"
+      if (match(line, /comment[[:space:]]+"[^"]*"/)) {
+        cm = substr(line, RSTART, RLENGTH)
+        sub(/^comment[[:space:]]+"/, "", cm)
+        sub(/"$/, "", cm)
+        gsub(/["\\|]/, "", cm)
+        if (cm != "") comment = cm
+      }
+      printf "%s|%s|%s|%s|%s\n", action, proto, port, src, comment
+    }
+  ' <<<"$raw" >"$NFT_RULES_FILE"
+  nft_sort_rules_file
+}
+
+nft_ensure_rules_file() {
+  if [[ ! -f $NFT_RULES_FILE ]]; then
+    install -d -m 700 -o root -g root "$(dirname "$NFT_RULES_FILE")"
+    : >"$NFT_RULES_FILE"
+    chmod 600 "$NFT_RULES_FILE"
+    chown root:root "$NFT_RULES_FILE"
+    nft_migrate_legacy_rules
+  fi
+}
+
+nft_rule_exists_any_source() {
+  local protocol=$1 port=$2
+  nft_ensure_rules_file
+  awk -F'|' -v proto="$protocol" -v port="$port" '
+    $2 == proto && ($3 + 0) == (port + 0) && $4 == "any" { found = 1 }
+    END { exit !found }
+  ' "$NFT_RULES_FILE"
+}
+
+nft_rule_exists_exact() {
+  local action=$1 protocol=$2 port=$3 source=$4
+  nft_ensure_rules_file
+  awk -F'|' -v act="$action" -v proto="$protocol" -v port="$port" -v src="$source" '
+    $1 == act && $2 == proto && ($3 + 0) == (port + 0) && $4 == src { found = 1 }
+    END { exit !found }
+  ' "$NFT_RULES_FILE"
+}
+
+nft_upsert_rule() {
+  local action=$1 protocol=$2 port=$3 source=$4 comment=$5
+  nft_ensure_rules_file
+  printf '%s|%s|%s|%s|%s\n' "$action" "$protocol" "$((10#$port))" "$source" "$comment" >>"$NFT_RULES_FILE"
+  nft_sort_rules_file
+}
+
+nft_render_config() {
+  local output_path=$1 action proto port src comment
+  nft_ensure_rules_file
+  {
+    cat <<'EOF'
 table inet suf {
   chain input {
     type filter hook input priority -100; policy drop;
@@ -633,45 +1056,574 @@ table inet suf {
     ct state established,related accept
     ip protocol icmp accept
     ip6 nexthdr icmpv6 accept
-    tcp dport ${ssh_port} accept comment "SUF SSH"
-${extra}
+EOF
+    while IFS='|' read -r action proto port src comment; do
+      [[ -n ${action:-} && -n ${proto:-} && -n ${port:-} && -n ${src:-} ]] || continue
+      comment=${comment:-受 SUF 管理的服务}
+      if [[ $src == any ]]; then
+        if [[ $action == limit ]]; then
+          printf '    %s dport %s ct state new limit rate 12/minute burst 6 packets accept comment "%s"\n' \
+            "$proto" "$port" "$comment"
+        else
+          printf '    %s dport %s accept comment "%s"\n' "$proto" "$port" "$comment"
+        fi
+      elif [[ $src == *:* ]]; then
+        if [[ $action == limit ]]; then
+          printf '    ip6 saddr %s %s dport %s ct state new limit rate 12/minute burst 6 packets accept comment "%s"\n' \
+            "$src" "$proto" "$port" "$comment"
+        else
+          printf '    ip6 saddr %s %s dport %s accept comment "%s"\n' "$src" "$proto" "$port" "$comment"
+        fi
+      else
+        if [[ $action == limit ]]; then
+          printf '    ip saddr %s %s dport %s ct state new limit rate 12/minute burst 6 packets accept comment "%s"\n' \
+            "$src" "$proto" "$port" "$comment"
+        else
+          printf '    ip saddr %s %s dport %s accept comment "%s"\n' "$src" "$proto" "$port" "$comment"
+        fi
+      fi
+    done <"$NFT_RULES_FILE"
+    cat <<'EOF'
   }
   chain output { type filter hook output priority 100; policy accept; }
 }
 EOF
-  nft delete table inet suf 2>/dev/null || true
-  nft -f "$NFT_CONF"
+  } >"$output_path"
+}
+
+nft_apply_config_file() {
+  local conf_file=$1
+  install -d -m 755 "$(dirname "$NFT_CONF")"
+  install -m 600 -o root -g root "$conf_file" "$NFT_CONF"
+  if nft_table_exists; then
+    if ! { printf 'delete table inet suf\n'; cat "$NFT_CONF"; } | nft -f - >/dev/null 2>&1; then
+      nft delete table inet suf 2>/dev/null || true
+      nft -f "$NFT_CONF"
+    fi
+  else
+    nft -f "$NFT_CONF"
+  fi
   nft_persistence
+}
+
+nft_validate_and_sync() {
+  local snapshot=${1:-} tmp_conf
+  nft_ensure_rules_file
+  nft_sort_rules_file
+  tmp_conf=$(mktemp)
+  nft_render_config "$tmp_conf"
+  if ! nft -c -f "$tmp_conf"; then
+    rm -f "$tmp_conf"
+    if [[ -n $snapshot && -f $snapshot ]]; then
+      cp -a "$snapshot" "$NFT_RULES_FILE"
+    fi
+    die "nftables 规则校验失败，未应用变更。"
+  fi
+  if nft_table_exists; then
+    nft_apply_config_file "$tmp_conf"
+  fi
+  rm -f "$tmp_conf"
+}
+
+nft_format_source() {
+  local src=$1
+  if [[ $src == any ]]; then
+    printf '任意来源（IPv4/IPv6）'
+  elif [[ $src == *:* ]]; then
+    printf '%s（IPv6）' "$src"
+  else
+    printf '%s（IPv4）' "$src"
+  fi
+}
+
+nft_format_action() {
+  case "$1" in
+    allow) printf '允许入站' ;;
+    limit) printf '限制入站连接' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+nft_print_rules_table() {
+  local numbered=${1:-yes} index=0 action proto port src comment
+  local target_text action_text source_text
+  nft_ensure_rules_file
+  nft_sort_rules_file
+  if [[ ! -s $NFT_RULES_FILE ]]; then
+    printf '  当前没有已保存的放行或连接限速规则。\n'
+    return 0
+  fi
+  if [[ $numbered == yes ]]; then
+    printf '  '; pad_col "编号" 5; printf ' '; pad_col "目标" 12; printf ' '; pad_col "操作" 14; printf ' '; pad_col "来源" 28; printf ' %s\n' "备注"
+  else
+    printf '  '; pad_col "目标" 12; printf ' '; pad_col "操作" 14; printf ' '; pad_col "来源" 28; printf ' %s\n' "备注"
+  fi
+  while IFS='|' read -r action proto port src comment; do
+    [[ -n ${action:-} && -n ${proto:-} && -n ${port:-} && -n ${src:-} ]] || continue
+    index=$((index + 1))
+    target_text="${port}/${proto}"
+    action_text=$(nft_format_action "$action")
+    source_text=$(nft_format_source "$src")
+    if [[ $numbered == yes ]]; then
+      printf '  '; pad_col "[${index}]" 5; printf ' '; pad_col "$target_text" 12; printf ' '; pad_col "$action_text" 14; printf ' '; pad_col "$source_text" 28; printf ' %s\n' "${comment:-受 SUF 管理的服务}"
+    else
+      printf '  '; pad_col "$target_text" 12; printf ' '; pad_col "$action_text" 14; printf ' '; pad_col "$source_text" 28; printf ' %s\n' "${comment:-受 SUF 管理的服务}"
+    fi
+  done <"$NFT_RULES_FILE"
+  ((index > 0)) || printf '  当前没有已保存的放行或连接限速规则。\n'
+}
+
+nft_ssh_port_covered_by_rules() {
+  local port=$1 client_ip=${2:-} action proto rport src _comment
+  nft_ensure_rules_file
+  while IFS='|' read -r action proto rport src _comment; do
+    [[ $proto == tcp && $((10#$rport)) -eq $((10#$port)) ]] || continue
+    [[ $src == any ]] && return 0
+    if [[ -n $client_ip ]] && ip_matches_source "$client_ip" "$src"; then
+      return 0
+    fi
+  done <"$NFT_RULES_FILE"
+  return 1
+}
+
+nft_warn_if_ssh_uncovered() {
+  local ssh_port client_ip
+  find_sshd >/dev/null 2>&1 || return 0
+  ssh_port=$(current_ssh_port)
+  client_ip=$(current_ssh_client_ip || true)
+  if ! nft_ssh_port_covered_by_rules "$ssh_port" "$client_ip"; then
+    warn "当前规则中没有任何放行 SSH 端口 ${ssh_port}/tcp 的规则！若防火墙已启用，应用后可能导致 SSH 断开并无法重连。"
+  fi
 }
 
 require_nftables() { command -v nft >/dev/null 2>&1 || die "nftables 尚未安装，请先选择安装。"; }
-install_nftables_service() { apk_install nftables; nft_persistence; rc-update add nftables default >/dev/null 2>&1 || true; ok "nftables 已安装。"; }
-enable_nftables_service() {
-  local port; require_nftables; ensure_openssh; port=$(current_ssh_port); nft_write_base "$port"; rc-service nftables start >/dev/null 2>&1 || true; ok "nftables 已启用，SSH 端口 ${port} 已放行。";
-}
-disable_nftables_service() { require_nftables; confirm "确认关闭 nftables 吗？" || die "取消关闭。"; nft delete table inet suf 2>/dev/null || true; nft_disable_persistence; ok "SUF nftables 防火墙规则已移除。"; }
-uninstall_nftables_service() { require_nftables; confirm "确认卸载 nftables 并保留配置吗？" || die "取消卸载。"; nft delete table inet suf 2>/dev/null || true; nft_disable_persistence; rc-service nftables stop >/dev/null 2>&1 || true; apk del nftables; ok "nftables 已卸载。"; }
-show_nftables_status() { if ! command -v nft >/dev/null 2>&1; then printf 'nftables：未安装\n'; elif nft_table_exists; then printf 'nftables：SUF 规则运行中\n'; nft list table inet suf; else printf 'nftables：未启用 SUF 规则\n'; fi; }
-reload_nftables() { require_nftables; [[ -f $NFT_CONF ]] || die "未找到 SUF nftables 配置。"; nft delete table inet suf 2>/dev/null || true; nft -f "$NFT_CONF"; ok "nftables 规则已重新加载。"; }
-allow_nft_port_value() {
-  local port=$1 protocol=$2 comment=${3:-SUF extra}
-  require_nftables
-  nft_table_exists || die "SUF nftables 规则尚未启用，请先选择启用 nftables。"
-  if nft list chain inet suf input 2>/dev/null | grep -Eq "${protocol} dport ${port}([[:space:]]|$)"; then
-    warn "已存在 ${port}/${protocol} 的放行规则，未重复添加。"
-    return
+
+ensure_default_web_nft_rules() {
+  local port protocol comment snapshot added=0
+  nft_ensure_rules_file
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+  for port in 80 443; do
+    if [[ $port == 80 ]]; then comment='网页 HTTP'; else comment='加密网页 HTTPS'; fi
+    for protocol in tcp udp; do
+      if nft_rule_exists_any_source "$protocol" "$port"; then
+        continue
+      fi
+      nft_upsert_rule allow "$protocol" "$port" any "$comment"
+      ok "已默认保存放行规则：${port}/${protocol}。"
+      added=1
+    done
+  done
+  if ((added)); then
+    nft_validate_and_sync "$snapshot"
   fi
-  nft add rule inet suf input "$protocol" dport "$port" accept comment "$comment"
-  nft list table inet suf >"$NFT_CONF"
-  nft_persistence
-  ok "已放行 ${port}/${protocol}。"
+  rm -f "$snapshot"
 }
 
-allow_nft_port() {
-  local port protocol
+install_nftables_service() {
+  apk_install nftables
+  ensure_default_web_nft_rules
+  ok "nftables 已安装。安装不会自动启用防火墙。"
+}
+
+enable_nftables_service() {
+  local ssh_port source_ip snapshot tmp_conf has_any_rule=0
+  require_nftables
+  if nft_table_exists; then
+    ok "SUF nftables 规则已经处于启用状态。"
+    return
+  fi
+  ensure_openssh
+  nft_ensure_rules_file
+  ssh_port=$(current_ssh_port)
+  source_ip=$(current_ssh_client_ip || true)
+
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+
+  if awk -F'|' -v port="$ssh_port" '$2 == "tcp" && ($3 + 0) == (port + 0) { found = 1 } END { exit !found }' "$NFT_RULES_FILE"; then
+    has_any_rule=1
+  fi
+  if ((has_any_rule == 0)); then
+    info "为当前 SSH 端口 ${ssh_port}/tcp 自动添加放行规则（同时支持 IPv4/IPv6）。"
+    nft_upsert_rule allow tcp "$ssh_port" any "SUF SSH 管理"
+  elif ! nft_ssh_port_covered_by_rules "$ssh_port" "$source_ip"; then
+    if [[ -n $source_ip ]]; then
+      info "检测到 ${ssh_port}/tcp 已限制来源，为当前 SSH 来源 ${source_ip} 补充临时访问权限防锁死。"
+      nft_upsert_rule allow tcp "$ssh_port" "$source_ip" "当前 SSH 客户端"
+    else
+      warn "未检测到当前 SSH 来源且 ${ssh_port}/tcp 已设置来源限制；为防止失联，将放行所有来源访问 TCP/${ssh_port}。"
+      confirm "确认按此方式保护当前管理入口吗？" || { cp -a "$snapshot" "$NFT_RULES_FILE"; rm -f "$snapshot"; die "取消启用。"; }
+      nft_upsert_rule allow tcp "$ssh_port" any "SSH 管理入口"
+    fi
+  fi
+
+  nft_sort_rules_file
+  tmp_conf=$(mktemp)
+  nft_render_config "$tmp_conf"
+  if ! nft -c -f "$tmp_conf"; then
+    cp -a "$snapshot" "$NFT_RULES_FILE"
+    rm -f "$tmp_conf" "$snapshot"
+    die "nftables 规则校验失败，未启用防火墙。"
+  fi
+
+  warn "nftables 启用后，未明确放行的入站端口将被阻止；云安全组不受本机防火墙控制。"
+  show_nftables_allowed_ports
+  if ! confirm "确认以上规则完整，可以启用 SUF nftables 吗？"; then
+    cp -a "$snapshot" "$NFT_RULES_FILE"
+    rm -f "$tmp_conf" "$snapshot"
+    die "未启用 nftables。"
+  fi
+
+  nft_apply_config_file "$tmp_conf"
+  rm -f "$tmp_conf" "$snapshot"
+  rc-update add nftables default >/dev/null 2>&1 || true
+  rc-service nftables start >/dev/null 2>&1 || true
+  ok "SUF nftables 规则已启用，SSH 端口 ${ssh_port} 已放行。"
+  show_nftables_status
+}
+
+disable_nftables_service() {
+  require_nftables
+  warn "关闭 SUF nftables 规则会让监听端口失去这层防火墙保护。"
+  confirm "确认关闭 SUF nftables 规则吗？" || die "取消关闭。"
+  nft delete table inet suf 2>/dev/null || true
+  nft_disable_persistence
+  ok "SUF nftables 防火墙规则已移除；规则记录仍保留在 ${NFT_RULES_FILE}。"
+}
+
+uninstall_nftables_service() {
+  require_nftables
+  warn "将移除 SUF nftables 规则并卸载软件包，但保留 ${NFT_RULES_FILE} 配置。"
+  confirm "确认卸载 nftables 并保留配置吗？" || die "取消卸载。"
+  nft delete table inet suf 2>/dev/null || true
+  nft_disable_persistence
+  rc-service nftables stop >/dev/null 2>&1 || true
+  rc-update del nftables default >/dev/null 2>&1 || true
+  apk del nftables
+  ok "nftables 已卸载，规则配置仍保留。"
+}
+
+show_nftables_status() {
+  if ! command -v nft >/dev/null 2>&1; then
+    printf 'nftables：%s\n' "$(colored_status 未安装)"
+    return
+  fi
+  nft_ensure_rules_file
+  printf 'nftables 防火墙状态\n'
+  if nft_table_exists; then
+    printf '  状态：%s\n' "$(colored_status 已启用)"
+  else
+    printf '  状态：%s\n' "$(colored_status 未启用)"
+  fi
+  printf '  规则表类型：inet（同时支持 IPv4 / IPv6）\n'
+  printf '  默认策略：拒绝（入站），允许（出站）\n'
+  printf '  基础放行：本地回环（lo）、已建立连接（established/related）、ICMP、ICMPv6\n'
+  if nft_table_exists; then
+    printf '\n已应用的放行/限速规则：\n'
+  else
+    printf '\n待应用的放行/限速规则（启用后生效）：\n'
+  fi
+  nft_print_rules_table no
+}
+
+show_nftables_rules() {
+  local tmp_conf
+  require_nftables
+  nft_ensure_rules_file
+  printf 'nftables 规则（按编号）\n'
+  nft_print_rules_table yes
+  if nft_table_exists; then
+    printf '\n已应用的底层 nftables 规则：\n'
+    nft list table inet suf
+  else
+    warn "nftables 当前未启用，以上编号为待应用规则编号。"
+    printf '\n待应用的底层 nftables 规则预览：\n'
+    tmp_conf=$(mktemp)
+    nft_render_config "$tmp_conf"
+    cat "$tmp_conf"
+    rm -f "$tmp_conf"
+  fi
+}
+
+reload_nftables() {
+  local tmp_conf
+  require_nftables
+  nft_ensure_rules_file
+  nft_sort_rules_file
+  if ! nft_table_exists; then
+    warn "SUF nftables 规则当前未启用，仅校验已保存规则。"
+    tmp_conf=$(mktemp)
+    nft_render_config "$tmp_conf"
+    nft -c -f "$tmp_conf" || { rm -f "$tmp_conf"; die "nftables 规则校验失败。"; }
+    rm -f "$tmp_conf"
+    ok "待应用规则校验通过；如需开启防火墙请选择“启用 SUF nftables 规则”。"
+    return
+  fi
+  nft_validate_and_sync
+  ok "nftables 规则已重新加载。"
+}
+
+show_nftables_allowed_ports() {
+  local action proto port src comment found=0
+  require_nftables
+  nft_ensure_rules_file
+  nft_sort_rules_file
+  printf 'nftables 已保存的放行/限速端口\n'
+  if ! nft_table_exists; then
+    warn "nftables 当前未启用；以下规则将在启用后生效。"
+  fi
+  while IFS='|' read -r action proto port src comment; do
+    [[ -n ${action:-} && -n ${proto:-} && -n ${port:-} && -n ${src:-} ]] || continue
+    if [[ $action == limit ]]; then
+      printf '  限速：%s/%s' "$port" "$proto"
+    else
+      printf '  放行：%s/%s' "$port" "$proto"
+    fi
+    if [[ $src != any ]]; then
+      printf '，来源 %s' "$(nft_format_source "$src")"
+    fi
+    printf '，备注 %s\n' "${comment:-受 SUF 管理的服务}"
+    found=1
+  done <"$NFT_RULES_FILE"
+  ((found)) || printf '  没有保存的放行或连接限速规则。\n'
+}
+
+nft_allow_port() {
+  local port protocols protocol comment snapshot
+  require_nftables
+  nft_ensure_rules_file
   port=$(prompt_port 443 "要放行的端口")
+  protocols=$(prompt_allow_protocols)
+  comment=$(prompt_rule_comment '受 SUF 管理的服务')
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+  for protocol in $protocols; do
+    nft_upsert_rule allow "$protocol" "$port" any "$comment"
+  done
+  nft_validate_and_sync "$snapshot"
+  rm -f "$snapshot"
+  ok "已放行端口 ${port} 的协议：${protocols}，备注：${comment}。"
+}
+
+nft_allow_source_to_port() {
+  local source port protocol comment snapshot broad_count
+  require_nftables
+  nft_ensure_rules_file
+  while true; do
+    if ! read -r -p "允许的来源 IP 或 CIDR：" source; then
+      printf '\n' >&2
+      return 1
+    fi
+    valid_ip_or_cidr "$source" && break
+    warn "IP 或 CIDR 格式无效（例如 1.2.3.4、1.2.3.0/24、2404:3881::/32）。"
+  done
+  port=$(prompt_port 22 "要限制来源的端口")
   protocol=$(prompt_protocol)
-  allow_nft_port_value "$port" "$protocol"
+  comment=$(prompt_rule_comment '仅限指定来源')
+
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+
+  broad_count=$(awk -F'|' -v proto="$protocol" -v port="$port" '
+    $2 == proto && ($3 + 0) == (port + 0) && $4 == "any" { count++ }
+    END { print count + 0 }
+  ' "$NFT_RULES_FILE")
+  if ((broad_count > 0)); then
+    warn "检测到 ${port}/${protocol} 仍有对所有来源开放的规则："
+    awk -F'|' -v proto="$protocol" -v port="$port" '
+      $2 == proto && ($3 + 0) == (port + 0) && $4 == "any" {
+        printf "  %s：%s/%s（%s）\n", ($1 == "limit" ? "限速" : "放行"), $3, $2, $5
+      }
+    ' "$NFT_RULES_FILE"
+    if ! confirm "删除这些广泛放行规则，使 IP 限制真正生效吗？"; then
+      rm -f "$snapshot"
+      die "已保留广泛规则，因此不能称为仅允许指定 IP。"
+    fi
+    local tmp
+    tmp=$(mktemp)
+    awk -F'|' -v proto="$protocol" -v port="$port" '
+      !($2 == proto && ($3 + 0) == (port + 0) && $4 == "any") { print }
+    ' "$NFT_RULES_FILE" >"$tmp"
+    install -m 600 -o root -g root "$tmp" "$NFT_RULES_FILE"
+    rm -f "$tmp"
+  fi
+
+  nft_upsert_rule allow "$protocol" "$port" "$source" "$comment"
+  nft_warn_if_ssh_uncovered
+  nft_validate_and_sync "$snapshot"
+  rm -f "$snapshot"
+  ok "已限制为 $(nft_format_source "$source") 可访问 ${port}/${protocol}。"
+}
+
+nft_limit_port() {
+  local default_port=22 port comment snapshot tmp
+  require_nftables
+  nft_ensure_rules_file
+  if find_sshd >/dev/null 2>&1; then
+    default_port=$(current_ssh_port)
+  fi
+  port=$(prompt_port "$default_port" "要限制新连接的 TCP 端口")
+  comment=$(prompt_rule_comment '连接限速服务')
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+  if nft_rule_exists_exact allow tcp "$port" any; then
+    tmp=$(mktemp)
+    awk -F'|' -v port="$port" '
+      !($1 == "allow" && $2 == "tcp" && ($3 + 0) == (port + 0) && $4 == "any") { print }
+    ' "$NFT_RULES_FILE" >"$tmp"
+    install -m 600 -o root -g root "$tmp" "$NFT_RULES_FILE"
+    rm -f "$tmp"
+  fi
+  nft_upsert_rule limit tcp "$port" any "$comment"
+  nft_validate_and_sync "$snapshot"
+  rm -f "$snapshot"
+  ok "已为 ${port}/tcp 添加连接限速规则（每分钟 12 次，突发 6 次）；限速仅用于 TCP 连接。"
+}
+
+nft_delete_numbered_rule() {
+  local total number selected snapshot tmp action proto port src comment
+  require_nftables
+  nft_ensure_rules_file
+  nft_sort_rules_file
+  show_nftables_rules
+  total=$(wc -l <"$NFT_RULES_FILE")
+  ((total > 0)) || die "当前没有可删除的 nftables 规则。"
+  read -r -p "要删除的规则编号（直接回车取消）：" number
+  [[ -n $number ]] || die "取消删除。"
+  [[ $number =~ ^[0-9]+$ ]] && ((10#$number >= 1 && 10#$number <= total)) || die "规则编号无效。"
+  number=$((10#$number))
+  selected=$(sed -n "${number}p" "$NFT_RULES_FILE")
+  IFS='|' read -r action proto port src comment <<<"$selected"
+  printf '即将删除规则 [%d]：%s %s/%s（%s，备注：%s）\n' \
+    "$number" "$(nft_format_action "$action")" "$port" "$proto" "$(nft_format_source "$src")" "$comment"
+
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+  tmp=$(mktemp)
+  sed "${number}d" "$NFT_RULES_FILE" >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$NFT_RULES_FILE"
+  rm -f "$tmp"
+  nft_warn_if_ssh_uncovered
+  if ! confirm "确认删除规则 ${number} 吗？"; then
+    cp -a "$snapshot" "$NFT_RULES_FILE"
+    rm -f "$snapshot"
+    die "取消删除。"
+  fi
+  nft_validate_and_sync "$snapshot"
+  rm -f "$snapshot"
+  ok "已删除规则编号 ${number}。"
+  show_nftables_rules
+}
+
+nft_delete_port_rules() {
+  local port protocols protocol match_count snapshot tmp
+  require_nftables
+  nft_ensure_rules_file
+  printf '请选择要删除的已放行或限速端口：\n'
+  show_nftables_allowed_ports
+  printf '\n'
+  port=$(prompt_port 443 "要删除规则的端口")
+  protocols=$(prompt_allow_protocols)
+
+  match_count=$(awk -F'|' -v port="$port" -v protos="$protocols" '
+    BEGIN { split(protos, p, " "); for (i in p) want[p[i]] = 1 }
+    ($3 + 0) == (port + 0) && ($2 in want) { count++ }
+    END { print count + 0 }
+  ' "$NFT_RULES_FILE")
+  ((match_count > 0)) || die "未找到端口 ${port}（${protocols}）的 nftables 规则。"
+
+  printf '将删除端口 %s 的以下 %d 条规则：\n' "$port" "$match_count"
+  awk -F'|' -v port="$port" -v protos="$protocols" '
+    BEGIN { split(protos, p, " "); for (i in p) want[p[i]] = 1 }
+    ($3 + 0) == (port + 0) && ($2 in want) {
+      printf "  %s %s/%s（%s，备注：%s）\n", ($1 == "limit" ? "限制入站连接" : "允许入站"), $3, $2, ($4 == "any" ? "任意来源" : $4), $5
+    }
+  ' "$NFT_RULES_FILE"
+
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+  tmp=$(mktemp)
+  awk -F'|' -v port="$port" -v protos="$protocols" '
+    BEGIN { split(protos, p, " "); for (i in p) want[p[i]] = 1 }
+    !(($3 + 0) == (port + 0) && ($2 in want)) { print }
+  ' "$NFT_RULES_FILE" >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$NFT_RULES_FILE"
+  rm -f "$tmp"
+  nft_warn_if_ssh_uncovered
+  if ! confirm "确认删除这些规则吗？请输入 y 执行删除"; then
+    cp -a "$snapshot" "$NFT_RULES_FILE"
+    rm -f "$snapshot"
+    die "取消删除。"
+  fi
+  nft_validate_and_sync "$snapshot"
+  rm -f "$snapshot"
+  ok "已删除端口 ${port} 的 ${match_count} 条规则。"
+  show_nftables_rules
+}
+
+nft_update_numbered_rule_comment() {
+  local total number selected action proto port src current_comment comment snapshot tmp
+  require_nftables
+  nft_ensure_rules_file
+  nft_sort_rules_file
+  show_nftables_rules
+  total=$(wc -l <"$NFT_RULES_FILE")
+  ((total > 0)) || die "当前没有可修改备注的 nftables 规则。"
+  read -r -p "要修改备注的规则编号：" number
+  [[ $number =~ ^[0-9]+$ ]] && ((10#$number >= 1 && 10#$number <= total)) || die "规则编号无效。"
+  number=$((10#$number))
+  selected=$(sed -n "${number}p" "$NFT_RULES_FILE")
+  IFS='|' read -r action proto port src current_comment <<<"$selected"
+  comment=$(prompt_rule_comment "${current_comment:-受 SUF 管理的服务}")
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+  tmp=$(mktemp)
+  awk -F'|' -v target="$number" -v new_comment="$comment" '
+    NR == target { printf "%s|%s|%s|%s|%s\n", $1, $2, $3, $4, new_comment; next }
+    { print }
+  ' "$NFT_RULES_FILE" >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$NFT_RULES_FILE"
+  rm -f "$tmp"
+  nft_validate_and_sync "$snapshot"
+  rm -f "$snapshot"
+  ok "已更新规则编号 ${number} 的备注：${comment}。"
+  show_nftables_rules
+}
+
+nft_update_port_comment() {
+  local port default_comment comment match_count snapshot tmp
+  require_nftables
+  nft_ensure_rules_file
+  printf '请选择要修改备注的已放行端口：\n'
+  show_nftables_allowed_ports
+  printf '\n'
+  port=$(prompt_port 443 "要修改备注的端口")
+  match_count=$(awk -F'|' -v port="$port" '
+    $1 == "allow" && ($3 + 0) == (port + 0) && $4 == "any" { count++ }
+    END { print count + 0 }
+  ' "$NFT_RULES_FILE")
+  ((match_count > 0)) || die "未找到端口 ${port} 的广泛放行规则。"
+  default_comment=$(awk -F'|' -v port="$port" '
+    $1 == "allow" && ($3 + 0) == (port + 0) && $4 == "any" { print $5; exit }
+  ' "$NFT_RULES_FILE")
+  comment=$(prompt_rule_comment "${default_comment:-受 SUF 管理的服务}")
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+  tmp=$(mktemp)
+  awk -F'|' -v port="$port" -v new_comment="$comment" '
+    $1 == "allow" && ($3 + 0) == (port + 0) && $4 == "any" {
+      printf "%s|%s|%s|%s|%s\n", $1, $2, $3, $4, new_comment
+      next
+    }
+    { print }
+  ' "$NFT_RULES_FILE" >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$NFT_RULES_FILE"
+  rm -f "$tmp"
+  nft_validate_and_sync "$snapshot"
+  rm -f "$snapshot"
+  ok "端口 ${port} 的 TCP/UDP 备注已更新为：${comment}。"
+  show_nftables_allowed_ports
 }
 
 public_listening_candidates() {
@@ -719,7 +1671,7 @@ is_public_listening_port() {
 }
 
 show_listening_ports() {
-  local offer_allow=${1:-yes} candidates port protocol
+  local offer_allow=${1:-yes} candidates port protocols protocol comment default_selection snapshot
   command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1 || die "未找到 ss 或 netstat，无法查询监听端口。"
   printf '以下是实际监听的服务与端口，不代表已被 nftables 放行：\n\n'
   candidates=$(public_listening_candidates || true)
@@ -734,18 +1686,58 @@ show_listening_ports() {
   if command -v ss >/dev/null 2>&1; then ss -lntup; else netstat -lntup; fi
 
   [[ $offer_allow == yes ]] || return
-  if ! command -v nft >/dev/null 2>&1 || ! nft_table_exists; then
-    info "启用 SUF nftables 规则后，可从此处选择监听端口加入放行规则。"
+  if ! command -v nft >/dev/null 2>&1; then
+    info "安装 nftables 后，可从此处选择监听端口加入放行规则。"
     return
   fi
   [[ -n $candidates ]] || return
-  confirm "要从上述公网监听端口中选择一个加入 nftables 放行规则吗？" || return
-  read -r -p "输入要放行的端口号：" port
-  valid_port "$port" || die "端口必须是 1 到 65535 的整数。"
-  port=$((10#$port))
-  protocol=$(prompt_protocol)
-  is_public_listening_port "$port" "$protocol" || die "未检测到 ${port}/${protocol} 的公网监听；仅本机监听的服务不能通过此菜单开放。"
-  allow_nft_port_value "$port" "$protocol" "SUF listening service"
+  info "可直接输入上述公网监听端口加入 nftables 放行规则；直接回车结束。"
+
+  while true; do
+    read -r -p "输入要放行的端口号（直接回车结束）：" port || return 0
+    [[ -n $port ]] || return 0
+    if ! valid_port "$port"; then
+      warn "端口必须是 1 到 65535 的整数。"
+      continue
+    fi
+    port=$((10#$port))
+    if is_public_listening_port "$port" tcp && is_public_listening_port "$port" udp; then
+      default_selection=1
+    elif is_public_listening_port "$port" tcp; then
+      default_selection=2
+    elif is_public_listening_port "$port" udp; then
+      default_selection=3
+    else
+      warn "未检测到 ${port} 的公网 TCP/UDP 监听；仅本机监听的服务不能通过此菜单开放。"
+      continue
+    fi
+    protocols=$(prompt_allow_protocols "$default_selection")
+    for protocol in $protocols; do
+      if ! is_public_listening_port "$port" "$protocol"; then
+        warn "未检测到 ${port}/${protocol} 的公网监听；仅本机监听的服务不能通过此菜单开放。"
+        protocols=""
+        break
+      fi
+    done
+    [[ -n $protocols ]] || continue
+    comment=$(prompt_rule_comment '从监听服务放行')
+    nft_ensure_rules_file
+    snapshot=$(mktemp)
+    cp -a "$NFT_RULES_FILE" "$snapshot"
+    for protocol in $protocols; do
+      if nft_rule_exists_any_source "$protocol" "$port"; then
+        warn "已存在 ${port}/${protocol} 的广泛放行或限速规则，未重复添加。"
+      else
+        nft_upsert_rule allow "$protocol" "$port" any "$comment"
+        ok "已将正在监听的 ${port}/${protocol} 加入 nftables 放行规则。"
+      fi
+    done
+    nft_validate_and_sync "$snapshot"
+    rm -f "$snapshot"
+    printf '\n'
+    show_nftables_allowed_ports
+    printf '\n'
+  done
 }
 
 show_running_services() {
@@ -795,73 +1787,538 @@ ensure_alpine_syslog() {
   die "syslog 已启动，但没有确认日志写入 /var/log/messages；未配置 Fail2ban。"
 }
 
-configure_fail2ban() {
-  local port=$1 jail_file=$FAIL2BAN_JAIL_FILE backup=""
-  apk_install fail2ban
-  ensure_openssh
-  ensure_alpine_syslog
-  mkdir -p "$FAIL2BAN_JAIL_DIR"; [[ -e $jail_file ]] && { backup="${BACKUP_ROOT}/fail2ban/suf.$(date +%Y%m%d-%H%M%S).local"; mkdir -p "${BACKUP_ROOT}/fail2ban"; cp -a "$jail_file" "$backup"; }
+fail2ban_jail_value() {
+  local key=$1
+  [[ -r $FAIL2BAN_JAIL_FILE ]] || return 0
+  awk -v wanted="$key" '
+    BEGIN { in_sshd = 0 }
+    /^[[:space:]]*[#;]/ { next }
+    /^[[:space:]]*\[/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\].*$/, "", section)
+      in_sshd = (tolower(section) == "sshd")
+      next
+    }
+    in_sshd && $0 ~ /^[[:space:]]*[^=]+=/ {
+      line = $0
+      k = line
+      sub(/[[:space:]]*=.*$/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (tolower(k) == tolower(wanted)) {
+        v = line
+        sub(/^[^=]*=[[:space:]]*/, "", v)
+        gsub(/[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    }
+  ' "$FAIL2BAN_JAIL_FILE"
+}
+
+merge_fail2ban_ignoreip() {
+  local existing="" client_ip="" raw_tokens=() item merged=()
+  if [[ -r $FAIL2BAN_JAIL_FILE ]]; then
+    existing=$(awk '
+      /^[[:space:]]*[#;]/ { next }
+      tolower($0) ~ /^[[:space:]]*ignoreip[[:space:]]*=/ {
+        v = $0
+        sub(/^[^=]*=[[:space:]]*/, "", v)
+        gsub(/,/, " ", v)
+        out = out (out ? " " : "") v
+      }
+      END { print out }
+    ' "$FAIL2BAN_JAIL_FILE")
+  fi
+  client_ip=$(current_ssh_client_ip || true)
+  raw_tokens=("127.0.0.1/8" "::1")
+  if [[ -n $existing ]]; then
+    for item in $existing; do
+      raw_tokens+=("$item")
+    done
+  fi
+  for item in "$@"; do
+    item=${item//,/ }
+    for item in $item; do
+      raw_tokens+=("$item")
+    done
+  done
+  if [[ -n $client_ip ]]; then
+    raw_tokens+=("$client_ip")
+    if [[ $client_ip =~ ^::[fF]{4}:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+      raw_tokens+=("${BASH_REMATCH[1]}")
+    fi
+  fi
+  for item in "${raw_tokens[@]}"; do
+    [[ -n $item ]] || continue
+    local seen=0 existing_item
+    for existing_item in "${merged[@]:-}"; do
+      if [[ $existing_item == "$item" ]]; then
+        seen=1
+        break
+      fi
+    done
+    ((seen == 0)) && merged+=("$item")
+  done
+  printf '%s\n' "${merged[*]}"
+}
+
+prompt_fail2ban_ignoreip() {
+  local default_ignoreip=$1 raw token tokens valid_tokens=()
+  while true; do
+    if ! read -r -p "白名单 IP（空格分隔，含当前连接保护）[${default_ignoreip}]：" raw; then
+      printf '\n' >&2
+      return 1
+    fi
+    raw=${raw:-$default_ignoreip}
+    raw=${raw//,/ }
+    valid_tokens=()
+    local all_ok=1
+    for token in $raw; do
+      if ! valid_ip_or_cidr "$token"; then
+        warn "白名单 IP 格式无效：${token}。"
+        all_ok=0
+        break
+      fi
+      valid_tokens+=("$token")
+    done
+    if ((all_ok == 1 && ${#valid_tokens[@]} > 0)); then
+      local out=("127.0.0.1/8" "::1")
+      for token in "${valid_tokens[@]}"; do
+        local seen=0 existing_item
+        for existing_item in "${out[@]}"; do
+          [[ $existing_item == "$token" ]] && { seen=1; break; }
+        done
+        ((seen == 0)) && out+=("$token")
+      done
+      printf '%s\n' "${out[*]}"
+      return
+    fi
+    ((all_ok == 0)) || warn "白名单不能为空，至少保留 127.0.0.1/8 ::1。"
+  done
+}
+
+ensure_fail2ban_client_protection() {
+  local ssh_port ignoreip_list client_ip tmp
+  if [[ ! -f /var/log/messages ]] || { ! rc-service syslog status >/dev/null 2>&1 && ! rc-service syslog-ng status >/dev/null 2>&1; }; then
+    ensure_alpine_syslog
+  fi
+  ssh_port=$(current_ssh_port)
+  client_ip=$(current_ssh_client_ip || true)
+  ignoreip_list=$(merge_fail2ban_ignoreip)
+  mkdir -p "$FAIL2BAN_JAIL_DIR"
+
+  if [[ ! -e $FAIL2BAN_JAIL_FILE ]]; then
+    cat >"$FAIL2BAN_JAIL_FILE" <<EOF
+# Managed by SUF: protect current SSH session and enable Alpine /var/log/messages sshd jail.
+[sshd]
+enabled = true
+port = ${ssh_port}
+backend = auto
+logpath = /var/log/messages
+ignoreip = ${ignoreip_list}
+EOF
+    chmod 600 "$FAIL2BAN_JAIL_FILE"
+    chown root:root "$FAIL2BAN_JAIL_FILE"
+  else
+    tmp=$(mktemp)
+    awk -v new_ignore="$ignoreip_list" '
+      BEGIN { in_sshd = 0; seen_sshd = 0; wrote_ignore = 0 }
+      /^[[:space:]]*\[/ {
+        if (in_sshd && !wrote_ignore) {
+          print "ignoreip = " new_ignore
+          wrote_ignore = 1
+        }
+        section = $0
+        sub(/^[[:space:]]*\[/, "", section)
+        sub(/\].*$/, "", section)
+        in_sshd = (tolower(section) == "sshd")
+        if (in_sshd) seen_sshd = 1
+        print
+        next
+      }
+      in_sshd && tolower($0) ~ /^[[:space:]]*ignoreip[[:space:]]*=/ {
+        if (!wrote_ignore) {
+          print "ignoreip = " new_ignore
+          wrote_ignore = 1
+        }
+        next
+      }
+      { print }
+      END {
+        if (in_sshd && !wrote_ignore) {
+          print "ignoreip = " new_ignore
+        } else if (!seen_sshd) {
+          print ""
+          print "[sshd]"
+          print "ignoreip = " new_ignore
+        }
+      }
+    ' "$FAIL2BAN_JAIL_FILE" >"$tmp"
+    install -m 600 -o root -g root "$tmp" "$FAIL2BAN_JAIL_FILE"
+    rm -f "$tmp"
+  fi
+
+  if [[ -n $client_ip ]]; then
+    info "已将当前 SSH 来源 IP（${client_ip}）加入 Fail2ban 白名单，防止启动扫描历史日志时误封。"
+  fi
+}
+
+show_fail2ban_start_diagnostics() {
+  warn "Fail2ban 未能保持运行，以下是 OpenRC 与日志诊断信息："
+  rc-service fail2ban status 2>&1 || true
+  if [[ -r /var/log/fail2ban.log ]]; then
+    printf '\n最近的 /var/log/fail2ban.log：\n'
+    tail -n 40 /var/log/fail2ban.log || true
+  elif [[ -r /var/log/messages ]]; then
+    printf '\n最近的 fail2ban 相关日志：\n'
+    grep -i 'fail2ban' /var/log/messages | tail -n 30 || true
+  fi
+}
+
+ensure_fail2ban_running() {
+  sleep 1
+  if ! rc-service fail2ban status >/dev/null 2>&1; then
+    show_fail2ban_start_diagnostics
+    die "Fail2ban 启动失败；请根据以上日志修复后再重试。"
+  fi
+}
+
+unban_current_ssh_ip_if_needed() {
+  local client_ip
+  client_ip=$(current_ssh_client_ip || true)
+  [[ -n $client_ip ]] || return 0
+  fail2ban-client status sshd >/dev/null 2>&1 || return 0
+  fail2ban-client set sshd unbanip "$client_ip" >/dev/null 2>&1 || true
+  if [[ $client_ip =~ ^::[fF]{4}:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    fail2ban-client set sshd unbanip "${BASH_REMATCH[1]}" >/dev/null 2>&1 || true
+  fi
+}
+
+configure_fail2ban_sshd() {
+  local port=$1 maxretry=$2 findtime=$3 bantime=$4 ignoreip=$5
+  local jail_file=$FAIL2BAN_JAIL_FILE backup=""
+  mkdir -p "$FAIL2BAN_JAIL_DIR"
+  if [[ -e $jail_file ]]; then
+    backup="${BACKUP_ROOT}/fail2ban/suf.$(date +%Y%m%d-%H%M%S).local"
+    mkdir -p "${BACKUP_ROOT}/fail2ban"
+    cp -a "$jail_file" "$backup"
+  fi
   cat >"$jail_file" <<EOF
 [sshd]
 enabled = true
 port = ${port}
 backend = auto
 logpath = /var/log/messages
-maxretry = 5
-findtime = 10m
-bantime = 1h
+maxretry = ${maxretry}
+findtime = ${findtime}
+bantime = ${bantime}
+bantime.increment = true
+bantime.factor = 2
+ignoreip = ${ignoreip}
 EOF
-  chmod 600 "$jail_file"; chown root:root "$jail_file"
+  chmod 600 "$jail_file"
+  chown root:root "$jail_file"
   if ! fail2ban-client -t; then
     if [[ -n $backup ]]; then cp -a "$backup" "$jail_file"; else rm -f "$jail_file"; fi
+    show_fail2ban_start_diagnostics
     die "Fail2ban 配置校验失败，已恢复原配置。"
   fi
   rc-update add fail2ban default >/dev/null 2>&1 || true
   if ! rc-service fail2ban restart >/dev/null 2>&1; then
     if [[ -n $backup ]]; then cp -a "$backup" "$jail_file"; else rm -f "$jail_file"; fi
     rc-service fail2ban restart >/dev/null 2>&1 || true
+    show_fail2ban_start_diagnostics
     die "Fail2ban 启动失败，已恢复原配置。"
   fi
   sleep 1
   if ! rc-service fail2ban status >/dev/null 2>&1; then
     if [[ -n $backup ]]; then cp -a "$backup" "$jail_file"; else rm -f "$jail_file"; fi
     rc-service fail2ban restart >/dev/null 2>&1 || true
+    show_fail2ban_start_diagnostics
     die "Fail2ban 启动后退出，已恢复原配置。"
   fi
+  unban_current_ssh_ip_if_needed
   ok "Fail2ban SSH 防护已启用。"
 }
 
-fail2ban_status() { if ! command -v fail2ban-client >/dev/null 2>&1; then printf 'Fail2ban：未安装\n'; elif rc-service fail2ban status >/dev/null 2>&1; then printf 'Fail2ban：运行中\n'; fail2ban-client status sshd 2>/dev/null || true; else printf 'Fail2ban：已停止或启动失败\n'; fi; }
-configure_current_fail2ban() { ensure_openssh; configure_fail2ban "$(current_ssh_port)"; }
-install_fail2ban() { apk_install fail2ban; rc-update add fail2ban default >/dev/null 2>&1 || true; rc-service fail2ban start; ok "Fail2ban 已安装。请使用配置选项启用 SSH jail。"; }
-reload_fail2ban() { command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; fail2ban-client -t; rc-service fail2ban restart; ok "Fail2ban 配置已校验并重新加载。"; }
-unban_fail2ban_ip() { local address; command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; read -r -p "要解封的 IPv4/IPv6 地址：" address; [[ $address =~ ^[0-9A-Fa-f:.]+$ ]] || die "IP 地址格式无效。"; fail2ban-client set sshd unbanip "$address"; ok "已提交解封：${address}。"; }
-stop_fail2ban() { command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; warn "停止 Fail2ban 后将不再自动封禁新的攻击来源。"; confirm "确认停止 Fail2ban 吗？" || die "取消停止。"; rc-service fail2ban stop; rc-update del fail2ban default >/dev/null 2>&1 || true; ok "Fail2ban 已停止并取消开机启动。"; }
-uninstall_fail2ban() { command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"; confirm "确认卸载 Fail2ban 并保留配置吗？" || die "取消卸载。"; rc-service fail2ban stop >/dev/null 2>&1 || true; apk del fail2ban; ok "Fail2ban 已卸载。"; }
+configure_fail2ban() {
+  local port default_maxretry default_findtime default_bantime default_ignoreip
+  local maxretry findtime bantime ignoreip
+  apk_install fail2ban
+  ensure_openssh
+  ensure_alpine_syslog
+  port=$(current_ssh_port)
+  info "已检测到当前 SSH 端口：${port}，Fail2ban 将保护此端口。"
+  default_maxretry=$(fail2ban_jail_value maxretry)
+  default_findtime=$(fail2ban_jail_value findtime)
+  default_bantime=$(fail2ban_jail_value bantime)
+  [[ $default_maxretry =~ ^[0-9]+$ ]] && ((10#$default_maxretry > 0)) || default_maxretry=5
+  [[ $default_findtime =~ ^[0-9]+[smhdw]?$ ]] || default_findtime=10m
+  [[ $default_bantime =~ ^[0-9]+[smhdw]?$ ]] || default_bantime=1h
+  default_ignoreip=$(merge_fail2ban_ignoreip)
+
+  maxretry=$(prompt_positive_integer "最大失败次数" "$default_maxretry")
+  findtime=$(prompt_duration "统计时间窗口" "$default_findtime")
+  bantime=$(prompt_duration "首次封禁时间" "$default_bantime")
+  ignoreip=$(prompt_fail2ban_ignoreip "$default_ignoreip")
+
+  configure_fail2ban_sshd "$port" "$maxretry" "$findtime" "$bantime" "$ignoreip"
+  show_fail2ban_sshd_status
+}
+
+fail2ban_status_value() {
+  local status=$1 label=$2
+  awk -v label="$label" '
+    index($0, label ":") {
+      value = substr($0, index($0, label ":") + length(label) + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      print value
+      exit
+    }
+  ' <<<"$status"
+}
+
+fail2ban_effective_ignoreip() {
+  local raw="" parsed=""
+  if raw=$(fail2ban-client get sshd ignoreip 2>/dev/null); then
+    parsed=$(awk '
+      /^[[:space:]]*(\||`)-/ {
+        sub(/^[[:space:]]*(\||`)-[[:space:]]*/, "", $0)
+        gsub(/[[:space:]]+$/, "", $0)
+        if ($0 != "") out = out (out ? " " : "") $0
+      }
+      END { print out }
+    ' <<<"$raw")
+  fi
+  if [[ -z $parsed && -r $FAIL2BAN_JAIL_FILE ]]; then
+    parsed=$(fail2ban_jail_value ignoreip)
+  fi
+  printf '%s\n' "${parsed:-未配置}"
+}
+
+show_fail2ban_sshd_status() {
+  local status current_failed total_failed current_banned total_banned banned_ips ignore_ips
+  if ! status=$(fail2ban-client status sshd 2>/dev/null); then
+    printf 'SSH 防护规则：尚未启用。\n'
+    return
+  fi
+
+  current_failed=$(fail2ban_status_value "$status" 'Currently failed')
+  total_failed=$(fail2ban_status_value "$status" 'Total failed')
+  current_banned=$(fail2ban_status_value "$status" 'Currently banned')
+  total_banned=$(fail2ban_status_value "$status" 'Total banned')
+  banned_ips=$(fail2ban_status_value "$status" 'Banned IP list')
+  ignore_ips=$(fail2ban_effective_ignoreip)
+
+  printf 'SSH 防护规则（sshd）\n'
+  printf '  当前失败次数：%s\n' "${current_failed:-0}"
+  printf '  累计失败次数：%s\n' "${total_failed:-0}"
+  printf '  当前封禁数量：%s\n' "${current_banned:-0}"
+  printf '  累计封禁数量：%s\n' "${total_banned:-0}"
+  printf '  已封禁 IP：%s\n' "${banned_ips:-无}"
+  printf '  白名单 IP：%s\n' "${ignore_ips:-未配置}"
+  printf '  日志来源：/var/log/messages（Alpine syslog）\n'
+}
+
+show_fail2ban_status() {
+  local status jail_list running=0
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    printf 'Fail2ban：%s\n' "$(colored_status 未安装)"
+    return
+  fi
+  printf 'Fail2ban 防护状态\n'
+  if rc-service fail2ban status >/dev/null 2>&1; then
+    running=1
+    printf '  服务状态：%s\n' "$(colored_status 运行中)"
+  else
+    printf '  服务状态：%s\n' "$(colored_status 已停止)"
+  fi
+  if ((running == 0)) || ! status=$(fail2ban-client status 2>/dev/null); then
+    printf '  防护规则：服务未运行，无法读取。\n'
+    return
+  fi
+  jail_list=$(fail2ban_status_value "$status" 'Jail list')
+  printf '  已启用防护规则：%s\n\n' "${jail_list:-无}"
+  show_fail2ban_sshd_status
+}
+
+fail2ban_status() { show_fail2ban_status "$@"; }
+
+configure_current_fail2ban() { configure_fail2ban; }
+
+install_fail2ban() {
+  apk_install fail2ban
+  ensure_openssh
+  ensure_fail2ban_client_protection
+  if ! fail2ban-client -t; then
+    show_fail2ban_start_diagnostics
+    die "Fail2ban 配置校验失败，服务尚未启动；请先修复上面的配置错误。"
+  fi
+  rc-update add fail2ban default >/dev/null 2>&1 || true
+  if rc-service fail2ban status >/dev/null 2>&1; then
+    if ! rc-service fail2ban restart; then
+      show_fail2ban_start_diagnostics
+      die "Fail2ban 重启失败，未显示为已启用。"
+    fi
+  else
+    if ! rc-service fail2ban start; then
+      show_fail2ban_start_diagnostics
+      die "Fail2ban 启动失败，未显示为已启用。"
+    fi
+  fi
+  ensure_fail2ban_running
+  unban_current_ssh_ip_if_needed
+  ok "Fail2ban 已安装并启动，SSH 防护已自动启用。如需调整参数请使用选项 3。"
+  show_fail2ban_sshd_status
+}
+
+reload_fail2ban() {
+  command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"
+  fail2ban-client -t
+  if rc-service fail2ban status >/dev/null 2>&1; then
+    fail2ban-client reload >/dev/null 2>&1 || rc-service fail2ban restart
+  else
+    rc-update add fail2ban default >/dev/null 2>&1 || true
+    if ! rc-service fail2ban start; then
+      show_fail2ban_start_diagnostics
+      die "Fail2ban 启动失败，未重新加载配置。"
+    fi
+  fi
+  ensure_fail2ban_running
+  ok "Fail2ban 配置已校验并重新加载。"
+}
+
+unban_fail2ban_ip() {
+  local address
+  command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"
+  show_fail2ban_sshd_status
+  printf '\n'
+  read -r -p "要解封的 IPv4/IPv6 地址（直接回车取消）：" address
+  [[ -n $address ]] || die "取消解封。"
+  [[ $address =~ ^[0-9A-Fa-f:.]+$ ]] || die "IP 地址格式无效。"
+  fail2ban-client set sshd unbanip "$address"
+  ok "已提交解封：${address}。"
+}
+
+stop_fail2ban() {
+  command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"
+  warn "停止 Fail2ban 后将不再自动封禁新的攻击来源。"
+  confirm "确认停止 Fail2ban 吗？" || die "取消停止。"
+  rc-service fail2ban stop
+  rc-update del fail2ban default >/dev/null 2>&1 || true
+  ok "Fail2ban 已停止并取消开机启动。"
+}
+
+uninstall_fail2ban() {
+  command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban 尚未安装。"
+  warn "将停止 Fail2ban 并移除软件包，但保留 /etc/fail2ban 配置。"
+  confirm "确认卸载 Fail2ban 并保留配置吗？" || die "取消卸载。"
+  rc-service fail2ban stop >/dev/null 2>&1 || true
+  rc-update del fail2ban default >/dev/null 2>&1 || true
+  apk del fail2ban
+  ok "Fail2ban 软件包已移除，配置文件仍保留。"
+}
+
+allow_extra_nft_ports() {
+  local input entry port proto
+  printf '\n额外端口格式示例：8443/tcp,51820/udp。留空表示不添加。\n'
+  read -r -p "需要额外放行的端口：" input
+  [[ -n $input ]] || return 0
+
+  IFS=',' read -r -a entries <<<"$input"
+  for entry in "${entries[@]}"; do
+    entry=${entry//[[:space:]]/}
+    [[ -n $entry ]] || continue
+    if [[ $entry =~ ^([0-9]+)/(tcp|udp)$ ]]; then
+      port=${BASH_REMATCH[1]}
+      proto=${BASH_REMATCH[2]}
+      if valid_port "$port"; then
+        nft_upsert_rule allow "$proto" "$((10#$port))" any "额外服务"
+        ok "已添加待应用放行规则：$((10#$port))/${proto}"
+        continue
+      fi
+    fi
+    die "无效端口规则：${entry}。应使用 端口/tcp 或 端口/udp。"
+  done
+}
 
 security_initialization_wizard() {
-  local target port
+  local target current_port port snapshot tmp_conf ignoreip
   cat <<'EOF'
-安全初始化向导将执行：
-  1. 安装公钥并验证密钥登录
-  2. 修改 SSH 端口并放行 nftables
-  3. 启用 SSH 仅密钥登录
-  4. 启用 nftables 入站默认拒绝
-  5. 安装并配置 Fail2ban SSH jail
+安全初始化向导将执行以下步骤：
+
+  1. 在本地电脑生成密钥对并安装公钥，随后在第二个终端验证密钥登录
+  2. 修改 SSH 端口（默认 28377）；请先确认云安全组已放行该端口
+  3. 检查当前监听端口，并配置、启用 nftables 防火墙（默认入站拒绝）
+  4. 启用 SSH 仅密钥登录，并在修改前备份配置
+  5. 安装并配置 Fail2ban SSH 防护（自动将当前连接 IP 加入白名单）
+
 仅建议用于新服务器或已确认全部公网服务端口的服务器。
 EOF
   confirm "确认执行安全初始化向导吗？" || die "取消安全初始化。"
-  ensure_openssh; install_public_key; target=$LAST_CONFIGURED_USER; require_tested_key_login "$target"; port=$(prompt_port "$DEFAULT_SSH_PORT" "新的 SSH 端口")
-  confirm "确认云安全组已放行 TCP/${port} 吗？" || die "取消初始化。"
+
+  ensure_openssh
+  install_public_key
+  target=$LAST_CONFIGURED_USER
+  require_tested_key_login "$target"
+
+  current_port=$(current_ssh_port)
+  port=$(prompt_port "$DEFAULT_SSH_PORT" "新的 SSH 端口")
+  warn "请先在云安全组放行 TCP/${port}，当前 SSH 会话不要关闭。"
+  confirm "已经放行或服务器没有外部安全组吗？" || die "取消初始化。"
+
+  apk_install nftables fail2ban
   show_listening_ports no
-  warn "即将启用入站默认拒绝；除 SSH ${port}/tcp 外，其他公网服务端口需稍后手动放行。"
-  confirm "确认继续启用 nftables 吗？" || die "取消初始化。"
-  install_nftables_service; nft_write_base "$port"; rc-service nftables start >/dev/null 2>&1 || true
-  write_sshd_hardening "$port" "$target"; configure_fail2ban "$port"; ok "Alpine 安全初始化完成。"
+  nft_ensure_rules_file
+  snapshot=$(mktemp)
+  cp -a "$NFT_RULES_FILE" "$snapshot"
+
+  nft_upsert_rule allow tcp "$port" any "SUF SSH 管理"
+  if [[ $current_port != "$port" ]]; then
+    nft_upsert_rule allow tcp "$current_port" any "当前 SSH 临时端口"
+  fi
+  if confirm "这台服务器需要对公网提供 HTTP/HTTPS 吗？"; then
+    nft_upsert_rule allow tcp 80 any "网页 HTTP"
+    nft_upsert_rule allow tcp 443 any "加密网页 HTTPS"
+  fi
+  allow_extra_nft_ports
+
+  nft_sort_rules_file
+  tmp_conf=$(mktemp)
+  nft_render_config "$tmp_conf"
+  if ! nft -c -f "$tmp_conf"; then
+    cp -a "$snapshot" "$NFT_RULES_FILE"
+    rm -f "$tmp_conf" "$snapshot"
+    die "nftables 规则校验失败，初始化已中止。"
+  fi
+  warn "启用后，未明确放行的入站端口将被阻止。"
+  show_nftables_allowed_ports
+  if ! confirm "确认以上规则完整，可以启用 nftables 吗？"; then
+    cp -a "$snapshot" "$NFT_RULES_FILE"
+    rm -f "$tmp_conf" "$snapshot"
+    die "取消初始化。"
+  fi
+
+  nft_apply_config_file "$tmp_conf"
+  rm -f "$tmp_conf" "$snapshot"
+  rc-update add nftables default >/dev/null 2>&1 || true
+  rc-service nftables start >/dev/null 2>&1 || true
+
+  write_sshd_hardening "$port" "$target"
+  ensure_alpine_syslog
+  ignoreip=$(merge_fail2ban_ignoreip)
+  configure_fail2ban_sshd "$port" 5 10m 1h "$ignoreip"
+  ok "Alpine 安全初始化完成。"
+  warn "不要关闭当前会话，先测试：ssh -p ${port} ${target}@服务器IP"
+  if [[ $current_port != "$port" ]]; then
+    warn "确认新连接成功后，可在 nftables 菜单删除不再需要的旧 SSH 端口 ${current_port}/tcp 规则。"
+  fi
 }
 
 project_dir() { [[ -n ${SUF_HOME:-} ]] && printf '%s\n' "$SUF_HOME" || printf '%s/suf\n' "$HOME"; }
-update_project() { local dir; apk_install git; dir=$(project_dir); [[ ! -L $dir ]] || die "${dir} 是符号链接，拒绝更新。"; if [[ -d ${dir}/.git ]]; then [[ $(git -C "$dir" remote get-url origin 2>/dev/null || true) == "${APP_REPOSITORY}.git" ]] || die "远程仓库不是 SUF。"; [[ -z $(git -C "$dir" status --porcelain) ]] || die "仓库存在未提交修改。"; git -C "$dir" pull --ff-only; elif [[ -e $dir ]]; then die "${dir} 不是 SUF Git 仓库。"; else git clone --depth 1 "${APP_REPOSITORY}.git" "$dir"; fi; [[ -f ${dir}/install.sh ]] || die "仓库中缺少 install.sh。"; bash "${dir}/install.sh" --no-launch; ok "SUF Alpine 已更新。"; }
+update_project() { local dir; apk_install git; dir=$(project_dir); [[ ! -L $dir ]] || die "${dir} 是符号链接，拒绝更新。"; if [[ -d ${dir}/.git ]]; then [[ $(git -C "$dir" remote get-url origin 2>/dev/null || true) == "${APP_REPOSITORY}.git" ]] || die "远程仓库不是 SUF。"; [[ -z $(git -C "$dir" status --porcelain) ]] || die "仓库存在未提交修改。"; git -C "$dir" pull --ff-only; elif [[ -e $dir ]]; then die "${dir} 不是 SUF Git 仓库。"; else git clone --depth 1 "${APP_REPOSITORY}.git" "$dir"; fi; [[ -f ${dir}/install.sh ]] || die "仓库中缺少 install.sh。"; bash "${dir}/install.sh" --no-launch; ok "SUF Alpine 已更新。退出后重新执行 suf 即可使用新版本。"; }
 
 menu_action_label() {
   case "$1" in
@@ -877,10 +2334,18 @@ menu_action_label() {
     enable_nftables_service) printf '启用 nftables' ;;
     disable_nftables_service) printf '关闭 nftables' ;;
     uninstall_nftables_service) printf '卸载 nftables' ;;
+    show_nftables_rules) printf '查看 nftables 编号规则' ;;
+    nft_delete_numbered_rule) printf '删除 nftables 编号规则' ;;
     reload_nftables) printf '重新加载 nftables' ;;
-    allow_nft_port) printf '放行 nftables 端口' ;;
+    show_nftables_allowed_ports) printf '查看 nftables 已放行端口' ;;
     show_listening_ports) printf '查看监听端口' ;;
-    fail2ban_status) printf '查看 Fail2ban 状态' ;;
+    nft_allow_port) printf '放行指定端口' ;;
+    nft_allow_source_to_port) printf '限制端口访问来源' ;;
+    nft_limit_port) printf '限制端口新连接' ;;
+    nft_delete_port_rules) printf '按端口删除 nftables 规则' ;;
+    nft_update_numbered_rule_comment) printf '按编号修改 nftables 规则备注' ;;
+    nft_update_port_comment) printf '按端口修改备注' ;;
+    show_fail2ban_status|fail2ban_status) printf '查看 Fail2ban 状态' ;;
     install_fail2ban) printf '安装 Fail2ban' ;;
     configure_current_fail2ban) printf '配置 SSH 防护' ;;
     reload_fail2ban) printf '重新加载 Fail2ban' ;;
@@ -923,33 +2388,53 @@ run_menu_action() {
   pause
 }
 
+run_repeatable_menu_action() {
+  local action=$1 status
+  shift
+  while true; do
+    set +e
+    (set -Eeuo pipefail; "$action" "$@")
+    status=$?
+    set -e
+    if ((status != 0)); then
+      explain_menu_failure "$action" "$status"
+      pause
+      return
+    fi
+    if ! confirm "继续执行$(menu_action_label "$action")吗？"; then
+      pause
+      return
+    fi
+  done
+}
+
 ssh_status_badge() {
   if ! command -v sshd >/dev/null 2>&1; then
-    printf '未安装'
+    colored_status 未安装
   elif rc-service sshd status >/dev/null 2>&1; then
-    printf '运行中'
+    colored_status 运行中
   else
-    printf '已停止'
+    colored_status 已停止
   fi
 }
 
 nftables_status_badge() {
   if ! command -v nft >/dev/null 2>&1; then
-    printf '未安装'
+    colored_status 未安装
   elif nft_table_exists; then
-    printf '运行中'
+    colored_status 运行中
   else
-    printf '已关闭'
+    colored_status 已关闭
   fi
 }
 
 fail2ban_status_badge() {
   if ! command -v fail2ban-client >/dev/null 2>&1; then
-    printf '未安装'
+    colored_status 未安装
   elif rc-service fail2ban status >/dev/null 2>&1; then
-    printf '运行中'
+    colored_status 运行中
   else
-    printf '已停止'
+    colored_status 已停止
   fi
 }
 
@@ -995,14 +2480,22 @@ firewall_menu() {
     cat <<EOF
 nftables 防火墙管理 [$(nftables_status_badge)]
 
-（1）查看状态与生效规则
+（1）查看状态
 （2）安装 nftables
 （3）启用 SUF nftables 规则
 （4）关闭 SUF nftables 规则
 （5）卸载 nftables（保留配置）
-（6）重新加载规则
-（7）放行指定端口
-（8）查看实际监听服务与端口并按需放行
+（6）查看编号规则
+（7）删除编号规则
+（8）重新加载规则
+（9）查看 nftables 已放行端口
+（10）查看实际监听端口并直接放行
+（11）放行指定端口
+（12）仅允许指定 IP/CIDR 访问端口
+（13）为端口添加连接限速
+（14）按端口删除已放行规则（IPv4/IPv6）
+（15）按编号规则修改备注
+（16）按端口修改备注（同时修改 TCP/UDP）
 （0）返回一级菜单
 EOF
     printf '\n'
@@ -1013,9 +2506,17 @@ EOF
       3) run_menu_action enable_nftables_service ;;
       4) run_menu_action disable_nftables_service ;;
       5) run_menu_action uninstall_nftables_service ;;
-      6) run_menu_action reload_nftables ;;
-      7) run_menu_action allow_nft_port ;;
-      8) run_menu_action show_listening_ports ;;
+      6) run_menu_action show_nftables_rules ;;
+      7) run_repeatable_menu_action nft_delete_numbered_rule ;;
+      8) run_menu_action reload_nftables ;;
+      9) run_menu_action show_nftables_allowed_ports ;;
+      10) run_menu_action show_listening_ports ;;
+      11) run_repeatable_menu_action nft_allow_port ;;
+      12) run_repeatable_menu_action nft_allow_source_to_port ;;
+      13) run_repeatable_menu_action nft_limit_port ;;
+      14) run_repeatable_menu_action nft_delete_port_rules ;;
+      15) run_repeatable_menu_action nft_update_numbered_rule_comment ;;
+      16) run_repeatable_menu_action nft_update_port_comment ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
@@ -1040,7 +2541,7 @@ EOF
     printf '\n'
     read -r -p "请选择：" choice
     case ${choice:-} in
-      1) run_menu_action fail2ban_status ;;
+      1) run_menu_action show_fail2ban_status ;;
       2) run_menu_action install_fail2ban ;;
       3) run_menu_action configure_current_fail2ban ;;
       4) run_menu_action reload_fail2ban ;;
@@ -1053,7 +2554,20 @@ EOF
   done
 }
 
-show_status() { printf '\n系统：Alpine Linux\n\n'; show_ssh_status; printf '\n\nnftables：\n'; show_nftables_status; printf '\nFail2ban：\n'; fail2ban_status; }
+show_status() {
+  local os_name="Alpine Linux"
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    os_name=${PRETTY_NAME:-Alpine Linux}
+  fi
+  printf '\n系统：%s\n\n' "$os_name"
+  show_ssh_status
+  printf '\n'
+  show_nftables_status
+  printf '\n'
+  show_fail2ban_status
+}
 
 menu() {
   while true; do
@@ -1102,4 +2616,6 @@ EOF
 }
 
 main() { case ${1:-menu} in -V|--version|version) printf 'suf %s\n' "$APP_VERSION";; -h|--help|help) usage;; menu|"") require_root "$@"; load_os; menu;; status) require_root "$@"; load_os; show_status;; services) require_root "$@"; load_os; show_runtime_status;; *) usage >&2; exit 2;; esac; }
-[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

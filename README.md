@@ -108,7 +108,7 @@ suf --help          # 查看帮助
 ## 菜单结构
 
 ```text
-SUF 1.2.20 - Server UFW & SSH Fortress
+SUF 1.2.21 - Server UFW & SSH Fortress
 
 （1）更新 SUF 项目
 （2）SSH 与密钥管理
@@ -173,23 +173,26 @@ SUF 1.2.20 - Server UFW & SSH Fortress
 
 ### Fail2ban 防暴力破解
 
+安装或配置 Fail2ban 时，SUF 会自动把当前 SSH 会话的来源 IP（含 IPv4/IPv6）加入 `ignoreip` 白名单，防止启动时扫描历史失败日志误封当前管理连接。
+
 | 选项 | 作用与注意事项 |
 | --- | --- |
-| `1` 查看服务与 SSH 防护规则状态 | 显示 Fail2ban 是否运行、`sshd` jail 和当前封禁情况。当前 SUF 只启用 SSH 防护，不会自动保护 Web、数据库等其他端口。 |
-| `2` 安装并启动 Fail2ban | 同时安装 `python3-systemd`，并自动为 SSH jail 使用 systemd 日志后端，适配 Debian/Ubuntu 无 `/var/log/auth.log` 的精简系统。安装后还可使用选项 `3` 调整 SSH 防护参数。 |
-| `3` 配置/修改 SSH 防护参数 | 使用 systemd 日志监控 SSH，自动读取当前生效的 SSH 端口；可设置最大失败次数、统计窗口和首次封禁时间。 |
+| `1` 查看服务与 SSH 防护规则状态 | 以全中文显示 Fail2ban 运行状态、`sshd` jail 失败/封禁统计、当前封禁 IP 与白名单 IP。当前 SUF 只启用 SSH 防护，不会自动保护 Web、数据库等其他端口。 |
+| `2` 安装并启动 Fail2ban | Debian/Ubuntu 会同时安装 `python3-systemd` 并配置 systemd 日志后端；Alpine 会确认 syslog 写入 `/var/log/messages` 并自动启用 SSH 防护。安装启动前均会自动将当前 SSH 来源 IP 加入白名单防止误封。 |
+| `3` 配置/修改 SSH 防护参数 | 自动读取当前生效的 SSH 端口；可设置最大失败次数、统计窗口、首次封禁时间以及白名单 IP（默认包含回环地址和当前 SSH 来源 IP）。 |
 | `4` 校验并重新加载配置 | 校验 Fail2ban 配置后重载；修改参数后使用。 |
-| `5` 解封指定 IP | 将误封的 IP 从 `sshd` jail 中移除。 |
+| `5` 解封指定 IP | 先显示当前 SSH 防护状态与封禁列表，再将误封的 IPv4/IPv6 从 `sshd` jail 中移除。 |
 | `6` 停止 Fail2ban | 停止服务并取消开机启动，新的暴力破解不会再被自动封禁；确认输入 `y`，直接回车取消。 |
 | `7` 卸载 Fail2ban | 移除软件包但保留 `/etc/fail2ban` 配置；确认输入 `y`，直接回车取消。 |
 
 ### Alpine 分支
 
-Alpine 分支的 SSH 菜单与 Debian/Ubuntu 保持相同的职责划分：安装公钥、启用仅密钥登录和修改 SSH 端口是三个独立操作；修改端口的默认值同样为 `28377`，直接按 Enter 即采用。修改端口时会先要求确认云安全组；如果 SUF nftables 规则正在运行，还会先放行新端口并暂时保留旧端口规则。
+Alpine 分支参考 Debian 版设计提供了完整一致的交互体验：
 
-Alpine 主菜单会显示 SSH、nftables 和 Fail2ban 的实时状态。选择“查看运行服务与监听端口”或执行 `suf services`，可以列出正在运行的 OpenRC 服务以及监听进程、协议、地址和端口。nftables 菜单还可以从公网监听端口中选择一个加入放行规则。
-
-Alpine 使用 nftables 和 OpenRC。Fail2ban 使用 `/var/log/messages` 文件后端；配置时如果日志文件不存在，脚本会自动启用 Alpine syslog 或安装 syslog-ng，并通过 `logger` 验证日志确实能写入后才继续。UFW 专用的编号规则和来源规则界面不适用。
+- **SSH 与密钥管理**：与 Debian/Ubuntu 保持相同职责划分（安装公钥、启用仅密钥登录、修改 SSH 端口独立操作，默认端口 `28377`，启用仅密钥登录前自动验证完整生效配置并支持失败回滚）。
+- **nftables 防火墙管理（16 项菜单）**：统一使用 `table inet suf` 同时管理 IPv4/IPv6 流量，结构化规则持久化保存在 `/etc/suf/nftables-rules.conf`（支持从旧版 `/etc/nftables.d/suf.nft` 平滑迁移）。安装时默认预置 `80/443` TCP/UDP 规则且不自动启用防火墙；启用前会确保放行当前 SSH 端口与来源 IP；支持编号规则查看/删除、按端口删除（IPv4/IPv6）、仅允许指定 IP/CIDR 访问（含严格校验）、TCP 连接限速、按编号/按端口修改中文备注，以及从监听端口直接交互放行。变更类操作均支持连续执行，且应用前先通过 `nft -c -f` 校验。
+- **Fail2ban 与中文状态展示**：主菜单与各状态视图均支持彩色中文状态（运行中/已启用/已关闭/未安装等）。Fail2ban 使用 `/var/log/messages` 文件后端（必要时自动启用 syslog 或安装 syslog-ng 并通过 `logger` 验证），安装启动即自动将当前 SSH 来源 IPv4/IPv6 加入 `ignoreip` 白名单并支持中文统计展示与参数自定义。
+- **运行状态与监听端口**：选择“查看运行服务与监听端口”或执行 `suf services`，可列出正在运行的 OpenRC 服务以及监听进程、协议、地址和端口。UFW 与 `--restore` 恢复卸载流程仅用于 Debian/Ubuntu，不适用于 Alpine。
 
 ## 推荐操作顺序
 
@@ -261,6 +264,7 @@ sudo bash ./uninstall.sh --restore
 /etc/ssh/sshd_config.d/00-suf-hardening.conf
 /etc/fail2ban/jail.d/suf.local
 /etc/nftables.d/suf.nft（Alpine）
+/etc/suf/nftables-rules.conf（Alpine 规则清单）
 /var/backups/suf/
 ```
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.20"
+APP_VERSION="1.2.21"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -257,6 +257,78 @@ prompt_duration() {
     fi
     warn "时间格式无效，可使用 600、10m、1h、1d 或 1w。"
   done
+}
+
+valid_ip_or_cidr() {
+  local value=$1
+  awk -v input="$value" '
+    function valid_ipv4(ip,    parts, n, i) {
+      if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return 0
+      n = split(ip, parts, ".")
+      if (n != 4) return 0
+      for (i = 1; i <= 4; i++) {
+        if (parts[i] + 0 > 255) return 0
+      }
+      return 1
+    }
+    function valid_ipv6(ip,    halves, nh, left, right, nl, nr, i, groups, ng, tail) {
+      if (ip == "" || ip !~ /^[0-9A-Fa-f:.]+$/) return 0
+      if (index(ip, ":::") > 0) return 0
+      if (ip ~ /\./) {
+        tail = ip
+        sub(/^.*:/, "", tail)
+        if (!valid_ipv4(tail)) return 0
+        sub(/:[^:]*$/, ":0:0", ip)
+      }
+      if (index(ip, "::") > 0) {
+        nh = split(ip, halves, "::")
+        if (nh > 2) return 0
+        nl = (halves[1] == "" ? 0 : split(halves[1], left, ":"))
+        nr = (halves[2] == "" ? 0 : split(halves[2], right, ":"))
+        for (i = 1; i <= nl; i++) if (left[i] !~ /^[0-9A-Fa-f]{1,4}$/) return 0
+        for (i = 1; i <= nr; i++) if (right[i] !~ /^[0-9A-Fa-f]{1,4}$/) return 0
+        return (nl + nr < 8)
+      }
+      ng = split(ip, groups, ":")
+      if (ng != 8) return 0
+      for (i = 1; i <= ng; i++) if (groups[i] !~ /^[0-9A-Fa-f]{1,4}$/) return 0
+      return 1
+    }
+    BEGIN {
+      if (input == "") exit 1
+      n = split(input, segs, "/")
+      if (n > 2) exit 1
+      ip = segs[1]
+      has_prefix = (n == 2)
+      prefix = (has_prefix ? segs[2] : "")
+      if (has_prefix && prefix !~ /^[0-9]+$/) exit 1
+      if (ip ~ /:/) {
+        if (!valid_ipv6(ip)) exit 1
+        if (has_prefix && (prefix + 0 < 0 || prefix + 0 > 128)) exit 1
+        exit 0
+      }
+      if (!valid_ipv4(ip)) exit 1
+      if (has_prefix && (prefix + 0 < 0 || prefix + 0 > 32)) exit 1
+      exit 0
+    }
+  '
+}
+
+current_ssh_client_ip() {
+  local candidate=""
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    candidate=${SSH_CONNECTION%% *}
+  elif [[ -n ${SSH_CLIENT:-} ]]; then
+    candidate=${SSH_CLIENT%% *}
+  elif command -v who >/dev/null 2>&1; then
+    candidate=$(who -m 2>/dev/null | sed -nE 's/.*\(([^)]+)\)[[:space:]]*$/\1/p' | head -n 1 || true)
+  fi
+  candidate=${candidate#[}
+  candidate=${candidate%]}
+  candidate=${candidate%%\%*}
+  if [[ -n $candidate && $candidate =~ ^[0-9A-Fa-f:.]+$ ]] && [[ $candidate == *.* || $candidate == *:* ]]; then
+    printf '%s\n' "$candidate"
+  fi
 }
 
 user_home() {
@@ -1745,8 +1817,131 @@ restore_fail2ban_jail() {
   fi
 }
 
+fail2ban_jail_value() {
+  local key=$1
+  [[ -r $FAIL2BAN_JAIL_FILE ]] || return 0
+  awk -v wanted="$key" '
+    BEGIN { in_sshd = 0 }
+    /^[[:space:]]*[#;]/ { next }
+    /^[[:space:]]*\[/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\].*$/, "", section)
+      in_sshd = (tolower(section) == "sshd")
+      next
+    }
+    in_sshd && $0 ~ /^[[:space:]]*[^=]+=/ {
+      line = $0
+      k = line
+      sub(/[[:space:]]*=.*$/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (tolower(k) == tolower(wanted)) {
+        v = line
+        sub(/^[^=]*=[[:space:]]*/, "", v)
+        gsub(/[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    }
+  ' "$FAIL2BAN_JAIL_FILE"
+}
+
+merge_fail2ban_ignoreip() {
+  local existing="" client_ip="" raw_tokens=() item merged=()
+  if [[ -r $FAIL2BAN_JAIL_FILE ]]; then
+    existing=$(awk '
+      /^[[:space:]]*[#;]/ { next }
+      tolower($0) ~ /^[[:space:]]*ignoreip[[:space:]]*=/ {
+        v = $0
+        sub(/^[^=]*=[[:space:]]*/, "", v)
+        gsub(/,/, " ", v)
+        out = out (out ? " " : "") v
+      }
+      END { print out }
+    ' "$FAIL2BAN_JAIL_FILE")
+  fi
+  client_ip=$(current_ssh_client_ip || true)
+  raw_tokens=("127.0.0.1/8" "::1")
+  if [[ -n $existing ]]; then
+    for item in $existing; do
+      raw_tokens+=("$item")
+    done
+  fi
+  for item in "$@"; do
+    item=${item//,/ }
+    for item in $item; do
+      raw_tokens+=("$item")
+    done
+  done
+  if [[ -n $client_ip ]]; then
+    raw_tokens+=("$client_ip")
+    if [[ $client_ip =~ ^::[fF]{4}:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+      raw_tokens+=("${BASH_REMATCH[1]}")
+    fi
+  fi
+  for item in "${raw_tokens[@]}"; do
+    [[ -n $item ]] || continue
+    local seen=0 existing_item
+    for existing_item in "${merged[@]:-}"; do
+      if [[ $existing_item == "$item" ]]; then
+        seen=1
+        break
+      fi
+    done
+    ((seen == 0)) && merged+=("$item")
+  done
+  printf '%s\n' "${merged[*]}"
+}
+
+prompt_fail2ban_ignoreip() {
+  local default_ignoreip=$1 raw token valid_tokens=()
+  while true; do
+    if ! read -r -p "白名单 IP（空格分隔，含当前连接保护）[${default_ignoreip}]：" raw; then
+      printf '\n' >&2
+      return 1
+    fi
+    raw=${raw:-$default_ignoreip}
+    raw=${raw//,/ }
+    valid_tokens=()
+    local all_ok=1
+    for token in $raw; do
+      if ! valid_ip_or_cidr "$token"; then
+        warn "白名单 IP 格式无效：${token}。"
+        all_ok=0
+        break
+      fi
+      valid_tokens+=("$token")
+    done
+    if ((all_ok == 1 && ${#valid_tokens[@]} > 0)); then
+      local out=("127.0.0.1/8" "::1")
+      for token in "${valid_tokens[@]}"; do
+        local seen=0 existing_item
+        for existing_item in "${out[@]}"; do
+          [[ $existing_item == "$token" ]] && { seen=1; break; }
+        done
+        ((seen == 0)) && out+=("$token")
+      done
+      printf '%s\n' "${out[*]}"
+      return
+    fi
+    ((all_ok == 0)) || warn "白名单不能为空，至少保留 127.0.0.1/8 ::1。"
+  done
+}
+
+unban_current_ssh_ip_if_needed() {
+  local client_ip
+  client_ip=$(current_ssh_client_ip || true)
+  [[ -n $client_ip ]] || return 0
+  fail2ban-client status sshd >/dev/null 2>&1 || return 0
+  fail2ban-client set sshd unbanip "$client_ip" >/dev/null 2>&1 || true
+  if [[ $client_ip =~ ^::[fF]{4}:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    fail2ban-client set sshd unbanip "${BASH_REMATCH[1]}" >/dev/null 2>&1 || true
+  fi
+}
+
 configure_fail2ban_sshd() {
   local ssh_port=$1 maxretry=$2 findtime=$3 bantime=$4
+  local ignoreip=${5:-$(merge_fail2ban_ignoreip)}
   local jail_file=$FAIL2BAN_JAIL_FILE backup_file
   mkdir -p "$FAIL2BAN_JAIL_DIR"
   backup_file=$(backup_fail2ban_jail "$jail_file")
@@ -1761,6 +1956,7 @@ findtime = ${findtime}
 bantime = ${bantime}
 bantime.increment = true
 bantime.factor = 2
+ignoreip = ${ignoreip}
 EOF
   chmod 600 "$jail_file"
   chown root:root "$jail_file"
@@ -1786,20 +1982,31 @@ EOF
     die "Fail2ban 启动后退出，已恢复原配置。"
   fi
 
+  unban_current_ssh_ip_if_needed
   ok "Fail2ban SSH 防护已启用。"
 }
 
 configure_fail2ban() {
-  local ssh_port maxretry findtime bantime
+  local ssh_port default_maxretry default_findtime default_bantime default_ignoreip
+  local maxretry findtime bantime ignoreip
   apt_install fail2ban python3-systemd
   ensure_openssh
   ssh_port=$(current_ssh_port)
   info "已检测到当前 SSH 端口：${ssh_port}，Fail2ban 将保护此端口。"
-  maxretry=$(prompt_positive_integer "最大失败次数" 5)
-  findtime=$(prompt_duration "统计时间窗口" 10m)
-  bantime=$(prompt_duration "首次封禁时间" 1h)
+  default_maxretry=$(fail2ban_jail_value maxretry)
+  default_findtime=$(fail2ban_jail_value findtime)
+  default_bantime=$(fail2ban_jail_value bantime)
+  [[ $default_maxretry =~ ^[0-9]+$ ]] && ((10#$default_maxretry > 0)) || default_maxretry=5
+  [[ $default_findtime =~ ^[0-9]+[smhdw]?$ ]] || default_findtime=10m
+  [[ $default_bantime =~ ^[0-9]+[smhdw]?$ ]] || default_bantime=1h
+  default_ignoreip=$(merge_fail2ban_ignoreip)
 
-  configure_fail2ban_sshd "$ssh_port" "$maxretry" "$findtime" "$bantime"
+  maxretry=$(prompt_positive_integer "最大失败次数" "$default_maxretry")
+  findtime=$(prompt_duration "统计时间窗口" "$default_findtime")
+  bantime=$(prompt_duration "首次封禁时间" "$default_bantime")
+  ignoreip=$(prompt_fail2ban_ignoreip "$default_ignoreip")
+
+  configure_fail2ban_sshd "$ssh_port" "$maxretry" "$findtime" "$bantime" "$ignoreip"
   show_fail2ban_sshd_status
 }
 
@@ -1832,30 +2039,79 @@ install_fail2ban_service() {
   fi
   systemctl enable fail2ban
   systemctl reset-failed fail2ban || true
-  if ! systemctl start fail2ban; then
+  if systemctl is-active --quiet fail2ban; then
+    if ! systemctl restart fail2ban; then
+      show_fail2ban_start_diagnostics
+      die "Fail2ban 重启失败，未显示为已启用。"
+    fi
+  elif ! systemctl start fail2ban; then
     show_fail2ban_start_diagnostics
     die "Fail2ban 启动失败，未显示为已启用。"
   fi
   ensure_fail2ban_running
+  unban_current_ssh_ip_if_needed
   ok "Fail2ban 已安装并启动。下一步请配置 SSH 防护规则。"
 }
 
 ensure_fail2ban_systemd_backend() {
+  local ignoreip_list client_ip tmp
   mkdir -p "$FAIL2BAN_JAIL_DIR"
+  client_ip=$(current_ssh_client_ip || true)
+  ignoreip_list=$(merge_fail2ban_ignoreip)
 
   # Debian may enable the sshd jail by default while still expecting
-  # /var/log/auth.log. Override only the backend so journald-only systems work.
-  if [[ -e $FAIL2BAN_JAIL_FILE ]]; then
-    return
-  fi
-
-  cat >"$FAIL2BAN_JAIL_FILE" <<'EOF'
+  # /var/log/auth.log. Override backend and whitelist current SSH client IP.
+  if [[ ! -e $FAIL2BAN_JAIL_FILE ]]; then
+    cat >"$FAIL2BAN_JAIL_FILE" <<EOF
 # Managed by SUF: use journald when /var/log/auth.log is unavailable.
 [sshd]
 backend = systemd
+ignoreip = ${ignoreip_list}
 EOF
-  chmod 600 "$FAIL2BAN_JAIL_FILE"
-  chown root:root "$FAIL2BAN_JAIL_FILE"
+    chmod 600 "$FAIL2BAN_JAIL_FILE"
+    chown root:root "$FAIL2BAN_JAIL_FILE"
+  elif [[ -n $client_ip ]]; then
+    tmp=$(mktemp)
+    awk -v new_ignore="$ignoreip_list" '
+      BEGIN { in_sshd = 0; seen_sshd = 0; wrote_ignore = 0 }
+      /^[[:space:]]*\[/ {
+        if (in_sshd && !wrote_ignore) {
+          print "ignoreip = " new_ignore
+          wrote_ignore = 1
+        }
+        section = $0
+        sub(/^[[:space:]]*\[/, "", section)
+        sub(/\].*$/, "", section)
+        in_sshd = (tolower(section) == "sshd")
+        if (in_sshd) seen_sshd = 1
+        print
+        next
+      }
+      in_sshd && tolower($0) ~ /^[[:space:]]*ignoreip[[:space:]]*=/ {
+        if (!wrote_ignore) {
+          print "ignoreip = " new_ignore
+          wrote_ignore = 1
+        }
+        next
+      }
+      { print }
+      END {
+        if (in_sshd && !wrote_ignore) {
+          print "ignoreip = " new_ignore
+        } else if (!seen_sshd) {
+          print ""
+          print "[sshd]"
+          print "ignoreip = " new_ignore
+        }
+      }
+    ' "$FAIL2BAN_JAIL_FILE" >"$tmp"
+    install -m 600 -o root -g root "$tmp" "$FAIL2BAN_JAIL_FILE"
+    rm -f "$tmp"
+  fi
+
+  if [[ -n $client_ip ]]; then
+    info "已将当前 SSH 来源 IP（${client_ip}）加入 Fail2ban 白名单，防止误封。"
+  fi
 }
 
 fail2ban_status_value() {
@@ -1864,14 +2120,33 @@ fail2ban_status_value() {
     index($0, label ":") {
       value = substr($0, index($0, label ":") + length(label) + 1)
       sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
       print value
       exit
     }
   ' <<<"$status"
 }
 
+fail2ban_effective_ignoreip() {
+  local raw="" parsed=""
+  if raw=$(fail2ban-client get sshd ignoreip 2>/dev/null); then
+    parsed=$(awk '
+      /^[[:space:]]*(\||`)-/ {
+        sub(/^[[:space:]]*(\||`)-[[:space:]]*/, "", $0)
+        gsub(/[[:space:]]+$/, "", $0)
+        if ($0 != "") out = out (out ? " " : "") $0
+      }
+      END { print out }
+    ' <<<"$raw")
+  fi
+  if [[ -z $parsed && -r $FAIL2BAN_JAIL_FILE ]]; then
+    parsed=$(fail2ban_jail_value ignoreip)
+  fi
+  printf '%s\n' "${parsed:-未配置}"
+}
+
 show_fail2ban_sshd_status() {
-  local status current_failed total_failed current_banned total_banned banned_ips
+  local status current_failed total_failed current_banned total_banned banned_ips ignore_ips
   if ! status=$(fail2ban-client status sshd 2>/dev/null); then
     printf 'SSH 防护规则：尚未启用。\n'
     return
@@ -1882,6 +2157,7 @@ show_fail2ban_sshd_status() {
   current_banned=$(fail2ban_status_value "$status" 'Currently banned')
   total_banned=$(fail2ban_status_value "$status" 'Total banned')
   banned_ips=$(fail2ban_status_value "$status" 'Banned IP list')
+  ignore_ips=$(fail2ban_effective_ignoreip)
 
   printf 'SSH 防护规则（sshd）\n'
   printf '  当前失败次数：%s\n' "${current_failed:-0}"
@@ -1889,6 +2165,7 @@ show_fail2ban_sshd_status() {
   printf '  当前封禁数量：%s\n' "${current_banned:-0}"
   printf '  累计封禁数量：%s\n' "${total_banned:-0}"
   printf '  已封禁 IP：%s\n' "${banned_ips:-无}"
+  printf '  白名单 IP：%s\n' "${ignore_ips:-未配置}"
   printf '  日志来源：systemd SSH 日志\n'
 }
 
@@ -1936,7 +2213,10 @@ reload_fail2ban_service() {
 unban_fail2ban_ip() {
   local address
   require_fail2ban
-  read -r -p "要解封的 IPv4/IPv6 地址：" address
+  show_fail2ban_sshd_status
+  printf '\n'
+  read -r -p "要解封的 IPv4/IPv6 地址（直接回车取消）：" address
+  [[ -n $address ]] || die "取消解封。"
   [[ $address =~ ^[0-9A-Fa-f:.]+$ ]] || die "IP 地址格式无效。"
   fail2ban-client set sshd unbanip "$address"
   ok "已提交解封：${address}。"
