@@ -108,7 +108,7 @@ suf --help          # 查看帮助
 ## 菜单结构
 
 ```text
-SUF 1.2.21 - Server UFW & SSH Fortress
+SUF 1.2.22 - Server UFW & SSH Fortress
 
 （1）更新 SUF 项目
 （2）SSH 与密钥管理
@@ -144,7 +144,7 @@ SUF 1.2.21 - Server UFW & SSH Fortress
 | `2` 安装/修复 OpenSSH 服务 | 安装并启动 OpenSSH；不会移除现有 SSH 配置。 |
 | `3` 公钥管理 | 跨账号查看已安装公钥的账号、指纹和注释，添加公钥或按编号删除指定公钥。添加时可选择管理员账号或无管理员权限的普通账号；新建普通账号不设置系统密码。脚本会提示在本地生成 Ed25519 密钥并粘贴 `.pub` 公钥；私钥不得上传。删除前会二次确认；如果删除账号最后一把有效公钥，脚本会警告该账号将无法再通过 SSH 密钥登录。 |
 | `4` 启用仅密钥登录 | 禁用 SSH 密码和键盘交互认证，保留当前端口。必须先在第二个终端验证密钥登录；确认输入 `y`，直接回车视为否。 |
-| `5` 修改 SSH 端口 | 仅修改 SSH 端口，不改变密码或密钥认证策略。新端口默认值为 `28377`，直接按 Enter 即采用该端口。检测到主配置或其它 drop-in 存在额外 `Port` 时，会显示来源并要求确认；确认后仅保留目标端口。必须先在云安全组放行新端口，SUF 会放行对应 UFW 规则。 |
+| `5` 修改 SSH 端口 | 仅修改 SSH 端口，不改变密码或密钥认证策略。新端口默认值为 `28377`，直接按 Enter 即采用该端口。检测到主配置或其它 drop-in 存在额外 `Port` 时，会显示来源并要求确认；确认后仅保留目标端口。必须先在云安全组放行新端口，SUF 会放行对应防火墙规则；若已配置 Fail2ban，还会自动同步更新 SSH 监控端口并重载。 |
 | `6` 校验并重新加载 SSH | 对配置执行语法校验后重载 SSH。适合手动修改 SSH 配置后使用。 |
 | `7` 恢复最近一次 SSH 配置备份 | 还原 SUF 保存的最新 SSH 配置。恢复后仍应保持当前会话并测试新连接。 |
 
@@ -190,9 +190,9 @@ SUF 1.2.21 - Server UFW & SSH Fortress
 Alpine 分支参考 Debian 版设计提供了完整一致的交互体验：
 
 - **SSH 与密钥管理**：与 Debian/Ubuntu 保持相同职责划分（安装公钥、启用仅密钥登录、修改 SSH 端口独立操作，默认端口 `28377`，启用仅密钥登录前自动验证完整生效配置并支持失败回滚）。
-- **nftables 防火墙管理（16 项菜单）**：统一使用 `table inet suf` 同时管理 IPv4/IPv6 流量，结构化规则持久化保存在 `/etc/suf/nftables-rules.conf`（支持从旧版 `/etc/nftables.d/suf.nft` 平滑迁移）。安装时默认预置 `80/443` TCP/UDP 规则且不自动启用防火墙；启用前会确保放行当前 SSH 端口与来源 IP；支持编号规则查看/删除、按端口删除（IPv4/IPv6）、仅允许指定 IP/CIDR 访问（含严格校验）、TCP 连接限速、按编号/按端口修改中文备注，以及从监听端口直接交互放行。变更类操作均支持连续执行，且应用前先通过 `nft -c -f` 校验。
-- **Fail2ban 与中文状态展示**：主菜单与各状态视图均支持彩色中文状态（运行中/已启用/已关闭/未安装等）。Fail2ban 使用 `/var/log/messages` 文件后端（必要时自动启用 syslog 或安装 syslog-ng 并通过 `logger` 验证），安装启动即自动将当前 SSH 来源 IPv4/IPv6 加入 `ignoreip` 白名单并支持中文统计展示与参数自定义。
-- **运行状态与监听端口**：选择“查看运行服务与监听端口”或执行 `suf services`，可列出正在运行的 OpenRC 服务以及监听进程、协议、地址和端口。UFW 与 `--restore` 恢复卸载流程仅用于 Debian/Ubuntu，不适用于 Alpine。
+- **nftables 防火墙管理（16 项菜单）**：统一使用 `table inet suf` 同时管理 IPv4/IPv6 流量，生成的 `/etc/nftables.d/suf.nft` 支持幂等原子重载，结构化规则持久化保存在 `/etc/suf/nftables-rules.conf`（支持从旧版 `/etc/nftables.d/suf.nft` 平滑迁移）。启用前会自动备份原有 `/etc/nftables.nft` 并接管持久化入口、提示移除冲突的 Alpine 默认 `table inet filter`，避免默认规则拦截 SSH 新端口或 80/443；安装时默认预置 `80/443` TCP/UDP 规则且不自动启用防火墙；启用前会确保放行当前 SSH 端口与来源 IP；支持编号规则查看/删除、按端口删除（IPv4/IPv6）、仅允许指定 IP/CIDR 访问（含严格校验）、TCP 连接限速、按编号/按端口修改中文备注，以及从监听端口直接交互放行。变更类操作均支持连续执行，且应用前先通过 `nft -c -f` 校验。
+- **Fail2ban 与中文状态展示**：主菜单与各状态视图均支持彩色中文状态（运行中/已启用/已关闭/未安装等）。Fail2ban 使用 `/var/log/messages` 文件后端（必要时自动启用 syslog 或安装 syslog-ng 并通过 `logger` 验证），安装启动即自动将当前 SSH 来源 IPv4/IPv6 加入 `ignoreip` 白名单并支持中文统计展示与参数自定义；修改 SSH 端口时自动同步 Fail2ban 监控端口。
+- **运行状态与权限适配**：安装、更新与卸载脚本均兼容 Alpine 的 `doas` 与 Debian 的 `sudo`，并为 `doas` 自动保留 `SSH_CONNECTION`/`SSH_CLIENT`/`SUF_HOME` 环境变量。选择“查看运行服务与监听端口”或执行 `suf services`，可列出正在运行的 OpenRC 服务以及监听进程、协议、地址和端口；主菜单 `8` 可直接卸载 SUF 命令（保留安全配置）。UFW 与 `--restore` 恢复卸载流程仅用于 Debian/Ubuntu，不适用于 Alpine。
 
 ## 推荐操作顺序
 

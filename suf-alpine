@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.21"
+APP_VERSION="1.2.22"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -14,6 +14,7 @@ FAIL2BAN_JAIL_FILE="${FAIL2BAN_JAIL_DIR}/${APP_NAME}.local"
 NFT_CONF="/etc/nftables.d/${APP_NAME}.nft"
 NFT_MAIN="/etc/nftables.nft"
 NFT_RULES_FILE="/etc/${APP_NAME}/nftables-rules.conf"
+NFT_BACKUP_DIR="${BACKUP_ROOT}/nftables"
 SSHD_BIN=""
 LAST_CONFIGURED_USER=""
 export LC_ALL=C
@@ -378,7 +379,7 @@ ensure_admin_user() {
   addgroup "$target" wheel >/dev/null 2>&1 || true
   apk_install doas
   install -d -m 755 /etc/doas.d
-  printf 'permit :wheel\n' >/etc/doas.d/00-suf.conf
+  printf 'permit setenv { SSH_CONNECTION SSH_CLIENT SUF_HOME } :wheel\n' >/etc/doas.d/00-suf.conf
   chmod 400 /etc/doas.d/00-suf.conf
 }
 
@@ -657,7 +658,7 @@ disable_foreign_ssh_port_directives() {
 reload_ssh() { "$SSHD_BIN" -t || return 1; rc-service sshd reload >/dev/null 2>&1 || rc-service sshd restart; }
 
 write_sshd_hardening() {
-  local port=$1 target=$2 backup_dir permit_root effective expected effective_root
+  local port=$1 target=$2 backup_dir permit_root effective expected effective_root effective_ports
   permit_root=$([[ $target == root ]] && printf 'prohibit-password' || printf 'no')
   backup_dir=$(backup_ssh_config); mkdir -p "$SSH_DROPIN_DIR"; ensure_dropin_include_first
   cat >"$SSH_DROPIN" <<EOF
@@ -674,10 +675,22 @@ MaxAuthTries 3
 LoginGraceTime 30
 EOF
   chmod 600 "$SSH_DROPIN"; chown root:root "$SSH_DROPIN"
+  if ! disable_foreign_ssh_port_directives; then
+    warn "无法禁用其它 SSH Port 配置，正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    die "没有应用任何 SSH 变更。"
+  fi
   if ! "$SSHD_BIN" -t; then
     warn "sshd 配置校验失败，正在自动恢复。"
     restore_ssh_backup "$backup_dir"
     "$SSHD_BIN" -t || die "旧配置恢复后仍无法通过校验，请保持当前会话并人工检查 ${SSH_MAIN}。"
+    die "没有应用任何 SSH 变更。"
+  fi
+  effective_ports=$(effective_sshd_values port)
+  if [[ $effective_ports != "$port" ]]; then
+    warn "最终 SSH 端口未收敛为 TCP/${port}，当前生效端口：${effective_ports//$'\n'/, }。正在自动恢复。"
+    restore_ssh_backup "$backup_dir"
+    "$SSHD_BIN" -t || die "恢复后的旧配置无法通过校验。"
     die "没有应用任何 SSH 变更。"
   fi
   effective=$("$SSHD_BIN" -T -C "user=root,host=$(hostname),addr=127.0.0.1")
@@ -889,9 +902,7 @@ change_ssh_port() {
     confirm "仍要继续修改 SSH 端口吗？" || die "取消操作。"
   fi
   write_sshd_port "$target"
-  if [[ -f $FAIL2BAN_JAIL_FILE ]]; then
-    info "如已启用 Fail2ban，请在 Fail2ban 菜单选择“配置/修改 SSH 防护参数”同步新端口 ${target}。"
-  fi
+  sync_fail2ban_ssh_port "$target"
 }
 
 pad_col() {
@@ -909,28 +920,58 @@ pad_col() {
 
 nft_table_exists() { nft list table inet suf >/dev/null 2>&1; }
 
-nft_main_has_wildcard_include() {
-  [[ -f $NFT_MAIN ]] || return 1
-  grep -qE '^[[:space:]]*include[[:space:]]+".*nftables\.d/\*\.nft"' "$NFT_MAIN"
+nft_backup_main_once() {
+  [[ -f $NFT_MAIN ]] || return 0
+  grep -q '^# Managed by SUF' "$NFT_MAIN" && return 0
+  if [[ ! -e ${NFT_BACKUP_DIR}/nftables.nft.orig ]]; then
+    install -d -m 700 -o root -g root "$NFT_BACKUP_DIR"
+    cp -a "$NFT_MAIN" "${NFT_BACKUP_DIR}/nftables.nft.orig"
+    info "原 ${NFT_MAIN} 已备份至 ${NFT_BACKUP_DIR}/nftables.nft.orig。"
+  fi
 }
 
 nft_persistence() {
+  local tmp
   install -d -m 755 "$(dirname "$NFT_CONF")"
-  touch "$NFT_MAIN"
-  if nft_main_has_wildcard_include; then
-    return 0
-  fi
-  grep -Fqx "include \"${NFT_CONF}\"" "$NFT_MAIN" || printf '\ninclude "%s"\n' "$NFT_CONF" >>"$NFT_MAIN"
+  install -d -m 755 "$(dirname "$NFT_MAIN")"
+  nft_backup_main_once
+  tmp=$(mktemp)
+  cat >"$tmp" <<EOF
+#!/usr/sbin/nft -f
+# Managed by SUF ${APP_VERSION} - original backed up under ${NFT_BACKUP_DIR}
+include "${NFT_CONF}"
+EOF
+  install -m 700 -o root -g root "$tmp" "$NFT_MAIN"
+  rm -f "$tmp"
 }
 
 nft_disable_persistence() {
-  rm -f "$NFT_CONF"
-  [[ -f $NFT_MAIN ]] || return 0
   local tmp
+  rm -f "$NFT_CONF"
+  rc-update del nftables default >/dev/null 2>&1 || true
+  [[ -f $NFT_MAIN ]] || return 0
   tmp=$(mktemp)
-  grep -Fvx "include \"${NFT_CONF}\"" "$NFT_MAIN" >"$tmp" || true
-  install -m 600 -o root -g root "$tmp" "$NFT_MAIN"
+  if grep -q '^# Managed by SUF' "$NFT_MAIN"; then
+    cat >"$tmp" <<'EOF'
+#!/usr/sbin/nft -f
+# Managed by SUF - disabled
+EOF
+  else
+    grep -Fvx "include \"${NFT_CONF}\"" "$NFT_MAIN" >"$tmp" || true
+  fi
+  install -m 700 -o root -g root "$tmp" "$NFT_MAIN"
   rm -f "$tmp"
+}
+
+nft_handle_conflicting_filter_table() {
+  nft list table inet filter >/dev/null 2>&1 || return 0
+  warn "检测到内核中存在默认的 table inet filter（Alpine 默认规则会拒绝未显式放行的端口，可能拦截 SSH 新端口及 80/443）。"
+  if confirm "移除冲突的 table inet filter，改由 SUF nftables 规则统一管理吗？"; then
+    nft delete table inet filter 2>/dev/null || warn "移除 table inet filter 失败，请手动检查 nft list ruleset。"
+    ok "已移除冲突的 table inet filter。"
+  else
+    warn "已保留 table inet filter；若端口访问异常，请检查 nft list table inet filter。"
+  fi
 }
 
 nft_sort_rules_file() {
@@ -1048,7 +1089,10 @@ nft_render_config() {
   local output_path=$1 action proto port src comment
   nft_ensure_rules_file
   {
-    cat <<'EOF'
+    cat <<EOF
+# Managed by SUF ${APP_VERSION}
+table inet suf
+delete table inet suf
 table inet suf {
   chain input {
     type filter hook input priority -100; policy drop;
@@ -1095,12 +1139,8 @@ nft_apply_config_file() {
   local conf_file=$1
   install -d -m 755 "$(dirname "$NFT_CONF")"
   install -m 600 -o root -g root "$conf_file" "$NFT_CONF"
-  if nft_table_exists; then
-    if ! { printf 'delete table inet suf\n'; cat "$NFT_CONF"; } | nft -f - >/dev/null 2>&1; then
-      nft delete table inet suf 2>/dev/null || true
-      nft -f "$NFT_CONF"
-    fi
-  else
+  if ! nft -f "$NFT_CONF"; then
+    nft delete table inet suf 2>/dev/null || true
     nft -f "$NFT_CONF"
   fi
   nft_persistence
@@ -1277,6 +1317,7 @@ enable_nftables_service() {
 
   nft_apply_config_file "$tmp_conf"
   rm -f "$tmp_conf" "$snapshot"
+  nft_handle_conflicting_filter_table
   rc-update add nftables default >/dev/null 2>&1 || true
   rc-service nftables start >/dev/null 2>&1 || true
   ok "SUF nftables 规则已启用，SSH 端口 ${ssh_port} 已放行。"
@@ -1637,7 +1678,7 @@ public_listening_candidates() {
         sub(/:[^:]*$/, "", host)
         gsub(/^\[/, "", host)
         gsub(/\]$/, "", host)
-        if (host !~ /^127\./ && host != "::1") {
+        if (host !~ /^127\./ && host != "::1" && host !~ /^::[fF]{4}:127\./) {
           printf "%s %s %s\n", $1, port, host
         }
       }
@@ -1654,7 +1695,7 @@ public_listening_candidates() {
         sub(/:[^:]*$/, "", host)
         gsub(/^\[/, "", host)
         gsub(/\]$/, "", host)
-        if (host !~ /^127\./ && host != "::1") {
+        if (host !~ /^127\./ && host != "::1" && host !~ /^::[fF]{4}:127\./) {
           printf "%s %s %s\n", protocol, port, host
         }
       }
@@ -1995,6 +2036,67 @@ unban_current_ssh_ip_if_needed() {
   fi
 }
 
+sync_fail2ban_ssh_port() {
+  local new_port=$1 backup="" tmp
+  [[ -f $FAIL2BAN_JAIL_FILE ]] || return 0
+  command -v fail2ban-client >/dev/null 2>&1 || return 0
+  backup="${BACKUP_ROOT}/fail2ban/suf.$(date +%Y%m%d-%H%M%S).local"
+  mkdir -p "${BACKUP_ROOT}/fail2ban"
+  cp -a "$FAIL2BAN_JAIL_FILE" "$backup"
+
+  tmp=$(mktemp)
+  awk -v new_port="$new_port" '
+    BEGIN { in_sshd = 0; seen_sshd = 0; wrote_port = 0 }
+    /^[[:space:]]*\[/ {
+      if (in_sshd && !wrote_port) {
+        print "port = " new_port
+        wrote_port = 1
+      }
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\].*$/, "", section)
+      in_sshd = (tolower(section) == "sshd")
+      if (in_sshd) seen_sshd = 1
+      print
+      next
+    }
+    in_sshd && tolower($0) ~ /^[[:space:]]*port[[:space:]]*=/ {
+      if (!wrote_port) {
+        print "port = " new_port
+        wrote_port = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (in_sshd && !wrote_port) {
+        print "port = " new_port
+      } else if (!seen_sshd) {
+        print ""
+        print "[sshd]"
+        print "port = " new_port
+      }
+    }
+  ' "$FAIL2BAN_JAIL_FILE" >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$FAIL2BAN_JAIL_FILE"
+  rm -f "$tmp"
+
+  if ! fail2ban-client -t >/dev/null 2>&1; then
+    cp -a "$backup" "$FAIL2BAN_JAIL_FILE"
+    warn "同步 Fail2ban SSH 端口校验失败，已恢复原 Fail2ban 配置。"
+    return 0
+  fi
+  if rc-service fail2ban status >/dev/null 2>&1; then
+    if ! fail2ban-client reload >/dev/null 2>&1 && ! rc-service fail2ban restart >/dev/null 2>&1; then
+      cp -a "$backup" "$FAIL2BAN_JAIL_FILE"
+      rc-service fail2ban restart >/dev/null 2>&1 || true
+      warn "同步 Fail2ban SSH 端口后重载失败，已恢复原 Fail2ban 配置。"
+      return 0
+    fi
+  fi
+  ok "Fail2ban SSH 监控端口已同步更新为 ${new_port}。"
+}
+
 configure_fail2ban_sshd() {
   local port=$1 maxretry=$2 findtime=$3 bantime=$4 ignoreip=$5
   local jail_file=$FAIL2BAN_JAIL_FILE backup=""
@@ -2303,6 +2405,7 @@ EOF
 
   nft_apply_config_file "$tmp_conf"
   rm -f "$tmp_conf" "$snapshot"
+  nft_handle_conflicting_filter_table
   rc-update add nftables default >/dev/null 2>&1 || true
   rc-service nftables start >/dev/null 2>&1 || true
 
@@ -2317,7 +2420,22 @@ EOF
   fi
 }
 
-project_dir() { [[ -n ${SUF_HOME:-} ]] && printf '%s\n' "$SUF_HOME" || printf '%s/suf\n' "$HOME"; }
+project_dir() {
+  local caller_user caller_home
+  if [[ -n ${SUF_HOME:-} ]]; then
+    printf '%s\n' "$SUF_HOME"
+    return
+  fi
+  caller_user=${DOAS_USER:-${SUDO_USER:-}}
+  if [[ -n $caller_user && $caller_user != root ]]; then
+    caller_home=$(user_home "$caller_user")
+    if [[ -n $caller_home ]]; then
+      printf '%s/suf\n' "$caller_home"
+      return
+    fi
+  fi
+  printf '%s/suf\n' "$HOME"
+}
 update_project() { local dir; apk_install git; dir=$(project_dir); [[ ! -L $dir ]] || die "${dir} 是符号链接，拒绝更新。"; if [[ -d ${dir}/.git ]]; then [[ $(git -C "$dir" remote get-url origin 2>/dev/null || true) == "${APP_REPOSITORY}.git" ]] || die "远程仓库不是 SUF。"; [[ -z $(git -C "$dir" status --porcelain) ]] || die "仓库存在未提交修改。"; git -C "$dir" pull --ff-only; elif [[ -e $dir ]]; then die "${dir} 不是 SUF Git 仓库。"; else git clone --depth 1 "${APP_REPOSITORY}.git" "$dir"; fi; [[ -f ${dir}/install.sh ]] || die "仓库中缺少 install.sh。"; bash "${dir}/install.sh" --no-launch; ok "SUF Alpine 已更新。退出后重新执行 suf 即可使用新版本。"; }
 
 menu_action_label() {
@@ -2582,6 +2700,7 @@ SUF ${APP_VERSION} - Alpine 服务器安全管理
 （5）查看整体安全状态
 （6）安全初始化向导
 （7）查看运行服务与监听端口
+（8）卸载 SUF 命令（保留安全配置）
 （0）退出
 EOF
     printf '\n'
@@ -2594,6 +2713,14 @@ EOF
       5) run_menu_action show_status ;;
       6) run_menu_action security_initialization_wizard ;;
       7) run_menu_action show_runtime_status ;;
+      8)
+        if [[ -x /usr/local/sbin/suf-uninstall ]]; then
+          if /usr/local/sbin/suf-uninstall; then exit 0; fi
+        else
+          warn "未找到卸载程序，请重新安装 SUF 后重试。"
+        fi
+        pause
+        ;;
       0) exit 0 ;;
       *) warn "无效选项。"; pause ;;
     esac

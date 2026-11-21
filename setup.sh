@@ -23,8 +23,13 @@ ensure_git() {
   command -v git >/dev/null 2>&1 && return
 
   if [[ $EUID -ne 0 ]]; then
-    command -v sudo >/dev/null 2>&1 || die "未找到 git，且当前用户无法使用 sudo 自动安装。"
-    elevate=(sudo)
+    if command -v sudo >/dev/null 2>&1; then
+      elevate=(sudo)
+    elif command -v doas >/dev/null 2>&1; then
+      elevate=(doas)
+    else
+      die "未找到 git，且当前用户无法使用 sudo 或 doas 自动安装。"
+    fi
   fi
 
   [[ -r /etc/os-release ]] || die "未找到 git，且无法识别系统以自动安装。"

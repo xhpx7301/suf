@@ -371,8 +371,13 @@ main() {
     *) die "未知参数：${mode}。用法：sudo bash uninstall.sh [--restore]" ;;
   esac
   if [[ $EUID -ne 0 ]]; then
-    command -v sudo >/dev/null 2>&1 || die "需要 root 权限，但系统未安装 sudo。"
-    exec sudo -- bash "$0" "$@"
+    if command -v sudo >/dev/null 2>&1; then
+      exec sudo -- bash "$0" "$@"
+    elif command -v doas >/dev/null 2>&1; then
+      exec doas -- bash "$0" "$@"
+    else
+      die "需要 root 权限，但系统未安装 sudo 或 doas。"
+    fi
   fi
   validate_installed_files
   if [[ $mode == --restore ]]; then
