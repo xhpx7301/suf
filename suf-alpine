@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.22"
+APP_VERSION="1.2.23"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -2672,6 +2672,35 @@ EOF
   done
 }
 
+show_security_consistency_check() {
+  local ssh_port="" f2b_port="" issues=0 checked=0
+  if find_sshd >/dev/null 2>&1; then
+    ssh_port=$(current_ssh_port)
+  fi
+  [[ -n $ssh_port ]] || return 0
+
+  if command -v nft >/dev/null 2>&1 && nft_table_exists; then
+    checked=1
+    if ! nft_ssh_port_covered_by_rules "$ssh_port" "$(current_ssh_client_ip || true)"; then
+      warn "一致性检查：SSH 当前监听 TCP/${ssh_port}，但 SUF nftables 未检测到覆盖该端口的放行规则！"
+      issues=$((issues + 1))
+    fi
+  fi
+
+  if command -v fail2ban-client >/dev/null 2>&1 && rc-service fail2ban status >/dev/null 2>&1 && [[ -r $FAIL2BAN_JAIL_FILE ]]; then
+    checked=1
+    f2b_port=$(fail2ban_jail_value port)
+    if [[ -n $f2b_port && $f2b_port != "$ssh_port" && ! ($f2b_port == ssh && $ssh_port == 22) ]]; then
+      warn "一致性检查：SSH 当前监听端口为 ${ssh_port}，但 Fail2ban 配置的监控端口为 ${f2b_port}，建议在 Fail2ban 菜单同步。"
+      issues=$((issues + 1))
+    fi
+  fi
+
+  if ((checked == 1 && issues == 0)); then
+    ok "一致性检查：SSH 端口（${ssh_port}）与 nftables / Fail2ban 配置一致。"
+  fi
+}
+
 show_status() {
   local os_name="Alpine Linux"
   if [[ -r /etc/os-release ]]; then
@@ -2685,6 +2714,8 @@ show_status() {
   show_nftables_status
   printf '\n'
   show_fail2ban_status
+  printf '\n'
+  show_security_consistency_check
 }
 
 menu() {

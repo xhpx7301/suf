@@ -20,8 +20,8 @@ done
 echo "all LF ok"
 
 echo "=== 3. Version & identity checks ==="
-[[ $(./suf --version) == "suf 1.2.22" ]] || { echo "FAIL suf version"; exit 1; }
-[[ $(./suf-alpine --version) == "suf 1.2.22" ]] || { echo "FAIL suf-alpine version"; exit 1; }
+[[ $(./suf --version) == "suf 1.2.23" ]] || { echo "FAIL suf version"; exit 1; }
+[[ $(./suf-alpine --version) == "suf 1.2.23" ]] || { echo "FAIL suf-alpine version"; exit 1; }
 grep -q '^APP_NAME="suf"$' suf
 grep -q '^APP_NAME="suf"$' suf-alpine
 echo "version & identity ok"
@@ -400,21 +400,45 @@ status_out=$(show_status)
 grep -q "SSH 服务状态" <<<"$status_out"
 grep -q "nftables 防火墙状态" <<<"$status_out"
 grep -q "Fail2ban 防护状态" <<<"$status_out"
+# Fail2ban port was synced to 28377 while mocked sshd listens on 22 -> consistency check must warn
+grep -q "一致性检查：SSH 当前监听端口为 22，但 Fail2ban 配置的监控端口为 28377" <<<"$status_out"
+sync_fail2ban_ssh_port 22 > /dev/null
+status_ok_out=$(show_status)
+grep -q "一致性检查：SSH 端口（22）与 nftables / Fail2ban 配置一致" <<<"$status_ok_out"
 echo "nftables & status tests ok"
 
-echo "=== 6. Test Debian suf Fail2ban additions ==="
+echo "=== 6. Test Debian suf Fail2ban, UFW, Docker & Runtime additions ==="
 # shellcheck source=/dev/null
 source ./suf
 FAIL2BAN_JAIL_DIR="$TMP/deb_jail.d"
 FAIL2BAN_JAIL_FILE="$FAIL2BAN_JAIL_DIR/suf.local"
 BACKUP_ROOT="$TMP/deb_backups"
+DOCKER_RULES_FILE="$TMP/deb_docker_rules.conf"
+SSHD_BIN="$TMP/bin/sshd"
+find_sshd_bin() { printf '%s\n' "$TMP/bin/sshd"; }
 systemctl() {
   case "$1:${2:-}" in
     is-active:--quiet) return 0 ;;
     is-active:fail2ban) printf 'active\n'; return 0 ;;
+    list-units:*)
+      printf 'ssh.service loaded active running OpenBSD Secure Shell server\n'
+      printf 'fail2ban.service loaded active running Fail2Ban Service\n'
+      return 0
+      ;;
   esac
   return 0
 }
+ufw() {
+  case "$1:${2:-}" in
+    status:) printf 'Status: active\n' ;;
+    show:added)
+      printf 'ufw allow 22/tcp comment '\''SUF SSH 管理'\''\n'
+      printf 'ufw allow 443/tcp comment '\''HTTPS'\''\n'
+      ;;
+  esac
+  return 0
+}
+
 SSH_CONNECTION="2404:3881:10d:1000::abcd 12345 ::1 22"
 ensure_fail2ban_systemd_backend > /dev/null
 grep -q "backend = systemd" "$FAIL2BAN_JAIL_FILE"
@@ -425,6 +449,35 @@ deb_f2b_out=$(show_fail2ban_status)
 grep -q "服务状态：运行中" <<<"$deb_f2b_out"
 grep -q "白名单 IP：" <<<"$deb_f2b_out"
 grep -q "日志来源：systemd SSH 日志" <<<"$deb_f2b_out"
+
+# Test UFW SSH rule detection & delete lockout warning
+ufw_has_broad_ssh_rule 22
+ufw_has_any_ssh_rule 22
+! ufw_has_broad_ssh_rule 28377
+ufw_rule_matches_ssh_port "[ 1] 22/tcp ALLOW IN Anywhere" 22
+! ufw_rule_matches_ssh_port "[ 2] 443/tcp ALLOW IN Anywhere" 22
+ssh_warn_out=$(ufw_warn_if_deleting_ssh_rule "ufw allow 22/tcp")
+grep -q "涉及当前 SSH 端口 TCP/22" <<<"$ssh_warn_out"
+
+# Test Debian consistency check (mismatch then match)
+cons_warn=$(show_security_consistency_check)
+grep -q "SSH 当前监听端口为 22，但 Fail2ban 配置的监控端口为 28377" <<<"$cons_warn"
+sync_fail2ban_ssh_port 22 > /dev/null
+cons_ok=$(show_security_consistency_check)
+grep -q "一致性检查：SSH 端口（22）与 UFW / Fail2ban 配置一致" <<<"$cons_ok"
+
+# Test Docker source rules viewing & deletion
+printf '1.2.3.4|8080|tcp\n2404:3881::1|8080|tcp\n' > "$DOCKER_RULES_FILE"
+printf '1\ny\n' | manage_docker_source_rules > /dev/null
+! grep -q "1.2.3.4|8080|tcp" "$DOCKER_RULES_FILE"
+grep -q "2404:3881::1|8080|tcp" "$DOCKER_RULES_FILE"
+printf 'y\n' | remove_docker_source_rules_for_port 8080 "tcp" > /dev/null
+! grep -q "2404:3881::1|8080|tcp" "$DOCKER_RULES_FILE"
+
+# Test show_running_services
+svc_out=$(show_running_services)
+grep -q "systemd 正在运行的服务" <<<"$svc_out"
+grep -q "ssh" <<<"$svc_out"
 echo "Debian suf tests ok"
 
 echo "ALL TESTS PASSED!"

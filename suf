@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_VERSION="1.2.22"
+APP_VERSION="1.2.23"
 APP_NAME="suf"
 APP_REPOSITORY="https://github.com/xhpx7301/suf"
 DEFAULT_SSH_PORT="28377"
@@ -1222,7 +1222,7 @@ is_public_listening_port() {
 }
 
 show_listening_ports() {
-  local candidates port protocols protocol comment default_selection
+  local offer_allow=${1:-yes} candidates port protocols protocol comment default_selection
   printf '以下是实际监听端口，不代表已被 UFW 放行：\n\n'
   if command -v ss >/dev/null 2>&1; then
     candidates=$(public_listening_candidates || true)
@@ -1240,6 +1240,7 @@ show_listening_ports() {
     die "未找到 ss，请安装 iproute2。"
   fi
 
+  [[ $offer_allow == yes ]] || return
   command -v ufw >/dev/null 2>&1 || {
     info "安装 UFW 后，可从此处选择监听端口加入放行规则。"
     return
@@ -1408,6 +1409,114 @@ restore_docker_firewall_rules() {
   done <"$DOCKER_RULES_FILE"
 }
 
+clear_docker_nft_rules_for_port() {
+  local port=$1 protocol=$2 family handle
+  command -v nft >/dev/null 2>&1 || return 0
+  for family in ip ip6; do
+    nft list chain "$family" filter DOCKER-USER >/dev/null 2>&1 || continue
+    while IFS= read -r handle; do
+      [[ -n $handle ]] || continue
+      nft delete rule "$family" filter DOCKER-USER handle "$handle" 2>/dev/null || true
+    done < <(
+      nft -a list chain "$family" filter DOCKER-USER 2>/dev/null | awk -v port="$port" -v proto="$protocol" '
+        index($0, "SUF-DOCKER-ALLOW-") && index($0, "-" port "-" proto "\"") ||
+        index($0, "SUF-DOCKER-DROP-" port "-" proto "\"") ||
+        index($0, "SUF-DOCKER-DROP-" port "-" proto "-") {
+          for (i = 1; i < NF; i++) {
+            if ($i == "handle") print $(i + 1)
+          }
+        }
+      '
+    )
+  done
+}
+
+clear_docker_iptables_rules_for_port() {
+  local port=$1 protocol=$2 firewall line
+  for firewall in iptables ip6tables; do
+    command -v "$firewall" >/dev/null 2>&1 || continue
+    "$firewall" -nL SUF-DOCKER >/dev/null 2>&1 || continue
+    while IFS= read -r line; do
+      [[ -n $line ]] || continue
+      # Convert "-A SUF-DOCKER ..." to "-D SUF-DOCKER ..."
+      local -a parts=()
+      read -r -a parts <<<"${line#-A }"
+      "$firewall" -D "${parts[@]}" 2>/dev/null || true
+    done < <(
+      "$firewall" -S SUF-DOCKER 2>/dev/null | grep -E "(-p ${protocol}[[:space:]].*--ctorigdstport ${port}([[:space:]]|$))" || true
+    )
+  done
+}
+
+remove_docker_source_rules_for_port() {
+  local port=$1 protocols=$2 match_count tmp protocol
+  [[ -f $DOCKER_RULES_FILE ]] || return 0
+  match_count=$(awk -F'|' -v port="$port" -v protos="$protocols" '
+    BEGIN { split(protos, p, " "); for (i in p) want[p[i]] = 1 }
+    ($2 + 0) == (port + 0) && ($3 in want) { count++ }
+    END { print count + 0 }
+  ' "$DOCKER_RULES_FILE")
+  ((match_count > 0)) || return 0
+
+  warn "检测到 ${match_count} 条与端口 ${port}（${protocols}）相关的 Docker 来源限制记录："
+  awk -F'|' -v port="$port" -v protos="$protocols" '
+    BEGIN { split(protos, p, " "); for (i in p) want[p[i]] = 1 }
+    ($2 + 0) == (port + 0) && ($3 in want) {
+      printf "  来源：%s -> %s/%s\n", $1, $2, $3
+    }
+  ' "$DOCKER_RULES_FILE"
+  confirm "是否同步清理这些 Docker 来源限制规则吗？" || return 0
+
+  tmp=$(mktemp)
+  awk -F'|' -v port="$port" -v protos="$protocols" '
+    BEGIN { split(protos, p, " "); for (i in p) want[p[i]] = 1 }
+    !(($2 + 0) == (port + 0) && ($3 in want)) { print }
+  ' "$DOCKER_RULES_FILE" >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$DOCKER_RULES_FILE"
+  rm -f "$tmp"
+
+  for protocol in $protocols; do
+    clear_docker_nft_rules_for_port "$port" "$protocol"
+    clear_docker_iptables_rules_for_port "$port" "$protocol"
+  done
+  restore_docker_firewall_rules
+  ok "已同步清理端口 ${port}（${protocols}）的 Docker 来源限制规则。"
+}
+
+manage_docker_source_rules() {
+  local index=0 source port protocol choice selected tmp
+  printf 'Docker 端口来源限制记录（%s）：\n' "$DOCKER_RULES_FILE"
+  if [[ ! -s $DOCKER_RULES_FILE ]]; then
+    printf '  当前没有已保存的 Docker 端口来源限制规则。\n'
+    return 0
+  fi
+  while IFS='|' read -r source port protocol; do
+    [[ -n ${source:-} && -n ${port:-} && -n ${protocol:-} ]] || continue
+    index=$((index + 1))
+    printf '  [%d] 来源：%s  目标：%s/%s\n' "$index" "$source" "$port" "$protocol"
+  done <"$DOCKER_RULES_FILE"
+  ((index > 0)) || { printf '  当前没有已保存的 Docker 端口来源限制规则。\n'; return 0; }
+
+  printf '\n'
+  read -r -p "输入要删除的编号（直接回车返回）：" choice || return 0
+  [[ -n $choice ]] || return 0
+  [[ $choice =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= index)) || die "编号无效。"
+  choice=$((10#$choice))
+  selected=$(sed -n "${choice}p" "$DOCKER_RULES_FILE")
+  IFS='|' read -r source port protocol <<<"$selected"
+  confirm "确认删除 Docker 来源限制 [${choice}]（${source} -> ${port}/${protocol}）吗？" || die "取消删除。"
+
+  tmp=$(mktemp)
+  sed "${choice}d" "$DOCKER_RULES_FILE" >"$tmp"
+  install -m 600 -o root -g root "$tmp" "$DOCKER_RULES_FILE"
+  rm -f "$tmp"
+
+  clear_docker_nft_rules_for_port "$port" "$protocol"
+  clear_docker_iptables_rules_for_port "$port" "$protocol"
+  restore_docker_firewall_rules
+  ok "已删除 Docker 来源限制：${source} -> ${port}/${protocol}。"
+}
+
 apply_docker_source_restriction_nft() {
   local source=$1 port=$2 protocol=$3 family opposite address_expr allow_comment drop_comment
   [[ $source == *:* ]] && family=ip6 || family=ip
@@ -1535,8 +1644,35 @@ ufw_delete_saved_rule_command() {
   ufw --force delete "${rule_parts[@]:1}" || die "删除已保存规则失败：${line}"
 }
 
+ufw_has_broad_ssh_rule() {
+  local ssh_port=$1
+  ufw show added 2>/dev/null | grep -Eq "^ufw (allow|limit) (${ssh_port}/tcp|${ssh_port})([[:space:]]|$)"
+}
+
+ufw_has_any_ssh_rule() {
+  local ssh_port=$1
+  ufw show added 2>/dev/null | grep -Eq "^ufw (allow|limit) ((${ssh_port}/tcp|${ssh_port})([[:space:]]|$)|from [^[:space:]]+ to any port ${ssh_port}( proto tcp)?([[:space:]]|$))"
+}
+
+ufw_rule_matches_ssh_port() {
+  local rule_text=$1 ssh_port=$2
+  [[ $rule_text =~ (^|[[:space:]])(${ssh_port}/tcp|${ssh_port})([[:space:]]|$) ]] ||
+    [[ $rule_text =~ to[[:space:]]+any[[:space:]]+port[[:space:]]+${ssh_port}([[:space:]]|$) ]]
+}
+
+ufw_warn_if_deleting_ssh_rule() {
+  local rule_text=$1 ssh_port=""
+  if SSHD_BIN=$(find_sshd_bin 2>/dev/null); then
+    ssh_port=$(current_ssh_port)
+  fi
+  [[ -n $ssh_port ]] || return 0
+  if ufw_rule_matches_ssh_port "$rule_text" "$ssh_port"; then
+    warn "警告：待删除的规则涉及当前 SSH 端口 TCP/${ssh_port}！若 UFW 已启用且没有其他放行规则，删除后可能导致无法重新建立 SSH 连接。"
+  fi
+}
+
 ufw_delete_numbered_rule() {
-  local number selected
+  local number selected matched_line
   local -a added_rules=()
   require_ufw
   show_ufw_rules
@@ -1551,6 +1687,7 @@ ufw_delete_numbered_rule() {
     [[ $number =~ ^[0-9]+$ ]] && ((10#$number >= 1 && 10#$number <= ${#added_rules[@]})) ||
       die "临时编号无效。"
     selected=${added_rules[$((10#$number - 1))]}
+    ufw_warn_if_deleting_ssh_rule "$selected"
     confirm "确认删除临时编号 ${number} 对应的规则吗？" || die "取消删除。"
     ufw_delete_saved_rule_command "$selected"
     ok "已删除临时编号 ${number} 对应的已保存规则。"
@@ -1559,9 +1696,18 @@ ufw_delete_numbered_rule() {
   fi
   read -r -p "要删除的规则编号：" number
   [[ $number =~ ^[0-9]+$ ]] && ((10#$number > 0)) || die "规则编号无效。"
-  if ! ufw status numbered 2>/dev/null | grep -Eq "^\[[[:space:]]*$((10#$number))[[:space:]]*\]"; then
+  matched_line=$(ufw status numbered 2>/dev/null | awk -v wanted="$((10#$number))" '
+    /^\[[[:space:]]*[0-9]+\][[:space:]]+/ {
+      n = $0
+      sub(/^\[[[:space:]]*/, "", n)
+      sub(/[[:space:]]*\].*$/, "", n)
+      if ((n + 0) == wanted) { print; exit }
+    }
+  ')
+  if [[ -z $matched_line ]]; then
     die "未找到规则编号 ${number}；请使用上方方括号中的实际编号。"
   fi
+  ufw_warn_if_deleting_ssh_rule "$matched_line"
   warn "删除后其他规则编号会变化。"
   confirm "确认删除规则 ${number} 吗？" || die "取消删除。"
   ufw --force delete "$((10#$number))" || die "删除规则编号 ${number} 失败；规则可能已被其他会话修改。"
@@ -1681,6 +1827,9 @@ ufw_delete_port_rules() {
   if ((${#numbers[@]} > 0)); then
     mapfile -t numbers < <(printf '%s\n' "${numbers[@]}" | sort -rn -u)
     printf '将删除端口 %s 的以下规则编号：%s\n' "$port" "${numbers[*]}"
+    if [[ " ${protocols} " == *" tcp "* ]]; then
+      ufw_warn_if_deleting_ssh_rule "${port}/tcp"
+    fi
     warn "这会同时删除所选协议的 IPv4 和 IPv6 规则；删除后其他规则编号会变化。"
     confirm "确认删除这些规则吗？请输入 y 执行删除" || die "取消删除。"
 
@@ -1705,6 +1854,9 @@ ufw_delete_port_rules() {
     ((${#added_rules[@]} > 0)) || die "未找到端口 ${port} 的 UFW 规则。"
     printf 'UFW 当前未启用，将删除端口 %s 的以下已保存规则：\n' "$port"
     printf '  %s\n' "${added_rules[@]}"
+    if [[ " ${protocols} " == *" tcp "* ]]; then
+      ufw_warn_if_deleting_ssh_rule "${port}/tcp"
+    fi
     confirm "确认删除这些已保存规则吗？请输入 y 执行删除" || die "取消删除。"
 
     for line in "${added_rules[@]}"; do
@@ -1712,6 +1864,7 @@ ufw_delete_port_rules() {
     done
     ok "已删除端口 ${port} 的 ${#added_rules[@]} 条已保存规则。"
   fi
+  remove_docker_source_rules_for_port "$port" "$protocols"
   show_ufw_rules
 }
 
@@ -1760,7 +1913,7 @@ ufw_is_active() {
 }
 
 enable_ufw_service() {
-  local ssh_port source_ip
+  local ssh_port source_ip protect_mode
   require_ufw
   if ufw_is_active; then
     ok "UFW 已经处于启用状态。"
@@ -1769,12 +1922,39 @@ enable_ufw_service() {
 
   ensure_openssh
   ssh_port=$(current_ssh_port)
-  source_ip=${SSH_CONNECTION:-}
-  source_ip=${source_ip%% *}
+  source_ip=$(current_ssh_client_ip || true)
 
-  if [[ -n ${SSH_CONNECTION:-} && $source_ip =~ ^[0-9A-Fa-f:.]+$ ]]; then
-    info "为当前 SSH 来源 ${source_ip} 保留 TCP/${ssh_port} 访问权限。"
-    ufw insert 1 allow from "$source_ip" to any port "$ssh_port" proto tcp comment '当前 SSH 客户端'
+  if ufw_has_broad_ssh_rule "$ssh_port"; then
+    info "检测到 UFW 已有 TCP/${ssh_port} 的放行/限速规则，直接沿用。"
+  elif ufw_has_any_ssh_rule "$ssh_port"; then
+    if [[ -n $source_ip ]]; then
+      if ! ufw show added 2>/dev/null | grep -Fq "from ${source_ip} to any port ${ssh_port}"; then
+        info "检测到 TCP/${ssh_port} 已设置来源限制，为当前 SSH 来源 ${source_ip} 补充临时访问权限防锁死。"
+        ufw insert 1 allow from "$source_ip" to any port "$ssh_port" proto tcp comment '当前 SSH 客户端'
+      fi
+    else
+      warn "未检测到当前 SSH 来源且 TCP/${ssh_port} 已设置来源限制；为防止失联，将放行所有来源访问 TCP/${ssh_port}。"
+      confirm "确认按此方式保护当前管理入口吗？" || die "取消启用。"
+      ufw insert 1 allow "${ssh_port}/tcp" comment 'SSH 管理入口'
+    fi
+  elif [[ -n $source_ip ]]; then
+    printf '\n当前 SSH 端口 TCP/%s 尚未添加放行规则，请选择保护方式：\n' "$ssh_port"
+    printf '  （1）放行所有来源访问 TCP/%s（默认，推荐，同时兼容 IPv4/IPv6 与动态 IP）\n' "$ssh_port"
+    printf '  （2）仅放行当前 SSH 来源 IP（%s）访问 TCP/%s\n' "$source_ip" "$ssh_port"
+    read -r -p "请选择 [1]：" protect_mode
+    case "${protect_mode:-1}" in
+      1)
+        ufw insert 1 allow "${ssh_port}/tcp" comment 'SUF SSH 管理'
+        ok "已放行所有来源访问 TCP/${ssh_port}（IPv4/IPv6）。"
+        ;;
+      2)
+        ufw insert 1 allow from "$source_ip" to any port "$ssh_port" proto tcp comment '当前 SSH 客户端'
+        ok "已仅放行当前 SSH 来源 ${source_ip} 访问 TCP/${ssh_port}。"
+        ;;
+      *)
+        die "选项无效，取消启用 UFW。"
+        ;;
+    esac
   else
     warn "未检测到当前 SSH 来源，将放行所有来源访问 TCP/${ssh_port}。"
     confirm "确认按此方式保护当前管理入口吗？" || die "取消启用。"
@@ -2447,6 +2627,54 @@ fail2ban_status_badge() {
   fi
 }
 
+show_running_services() {
+  local units count
+  printf 'systemd 正在运行的服务：\n'
+  units=$(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print $1}' | sed 's/\.service$//' || true)
+  if [[ -n $units ]]; then
+    count=$(wc -l <<<"$units")
+    printf '  共 %s 项：\n' "$count"
+    awk '{ printf "  %s\n", $0 }' <<<"$units"
+  else
+    printf '  没有检测到正在运行的 systemd 服务。\n'
+  fi
+}
+
+show_runtime_status() {
+  show_running_services
+  printf '\n'
+  show_listening_ports no
+}
+
+show_security_consistency_check() {
+  local ssh_port="" f2b_port="" issues=0 checked=0
+  if SSHD_BIN=$(find_sshd_bin 2>/dev/null); then
+    ssh_port=$(current_ssh_port)
+  fi
+  [[ -n $ssh_port ]] || return 0
+
+  if ufw_is_active; then
+    checked=1
+    if ! ufw_has_any_ssh_rule "$ssh_port"; then
+      warn "一致性检查：SSH 当前监听 TCP/${ssh_port}，但 UFW 未检测到该端口的放行规则！"
+      issues=$((issues + 1))
+    fi
+  fi
+
+  if command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active --quiet fail2ban && [[ -r $FAIL2BAN_JAIL_FILE ]]; then
+    checked=1
+    f2b_port=$(fail2ban_jail_value port)
+    if [[ -n $f2b_port && $f2b_port != "$ssh_port" && ! ($f2b_port == ssh && $ssh_port == 22) ]]; then
+      warn "一致性检查：SSH 当前监听端口为 ${ssh_port}，但 Fail2ban 配置的监控端口为 ${f2b_port}，建议在 Fail2ban 菜单同步。"
+      issues=$((issues + 1))
+    fi
+  fi
+
+  if ((checked == 1 && issues == 0)); then
+    ok "一致性检查：SSH 端口（${ssh_port}）与 UFW / Fail2ban 配置一致。"
+  fi
+}
+
 show_status() {
   printf '\n系统：'
   if [[ -r /etc/os-release ]]; then
@@ -2463,11 +2691,13 @@ show_status() {
   if command -v ufw >/dev/null 2>&1; then
     show_ufw_status || true
   else
-    printf '  未安装\n'
+    printf '  %s\n' "$(colored_status 未安装)"
   fi
 
   printf '\nFail2ban：\n'
   show_fail2ban_status
+  printf '\n'
+  show_security_consistency_check
 }
 
 show_security_setup_preview() {
@@ -2555,6 +2785,7 @@ menu_action_label() {
     ufw_delete_port_rules) printf '按端口删除 UFW 规则' ;;
     ufw_update_numbered_rule_comment) printf '按编号修改 UFW 规则备注' ;;
     ufw_update_port_comment) printf '按端口修改备注' ;;
+    manage_docker_source_rules) printf '管理 Docker 端口来源限制' ;;
     show_fail2ban_status) printf '查看 Fail2ban 状态' ;;
     install_fail2ban_service) printf '安装 Fail2ban' ;;
     configure_fail2ban) printf '配置 SSH 防护' ;;
@@ -2563,6 +2794,7 @@ menu_action_label() {
     stop_fail2ban_service) printf '停止 Fail2ban' ;;
     uninstall_fail2ban_service) printf '卸载 Fail2ban' ;;
     show_status) printf '查看系统状态' ;;
+    show_runtime_status) printf '查看运行服务与监听端口' ;;
     security_initialization_wizard) printf '运行安全初始化向导' ;;
     update_suf_project) printf '更新 SUF' ;;
     *) printf '%s' "$1" ;;
@@ -2683,6 +2915,7 @@ UFW 防火墙管理 [$(ufw_status_badge)]
 （14）按端口删除已放行规则（支持 UFW 未启用）
 （15）按编号规则修改备注
 （16）按端口修改备注（同时修改 TCP/UDP）
+（17）查看/清理 Docker 端口来源限制
 （0）返回一级菜单
 EOF
     printf '\n'
@@ -2704,6 +2937,7 @@ EOF
       14) run_repeatable_menu_action ufw_delete_port_rules ;;
       15) run_repeatable_menu_action ufw_update_numbered_rule_comment ;;
       16) run_repeatable_menu_action ufw_update_port_comment ;;
+      17) run_menu_action manage_docker_source_rules ;;
       0) return ;;
       *) warn "无效选项。"; pause ;;
     esac
@@ -2754,6 +2988,7 @@ SUF ${APP_VERSION} - Server UFW & SSH Fortress (Debian/Ubuntu)
 （5）查看整体安全状态
 （6）安全初始化向导
 （7）卸载 SUF 并按备份恢复设置
+（8）查看运行服务与监听端口
 （0）退出
 EOF
     printf '\n'
@@ -2773,6 +3008,7 @@ EOF
         fi
         pause
         ;;
+      8) run_menu_action show_runtime_status ;;
       0) exit 0 ;;
       *) warn "无效选项。"; pause ;;
     esac
@@ -2787,6 +3023,7 @@ SUF ${APP_VERSION} - Server UFW & SSH Fortress
   suf               打开交互式菜单
   suf menu          打开交互式菜单
   suf status        查看整体安全状态
+  suf services      查看运行中的 systemd 服务和监听端口
   suf --version     显示版本
   suf --help        显示帮助
 
@@ -2811,6 +3048,11 @@ main() {
       require_root "$@"
       load_os
       show_status
+      ;;
+    services)
+      require_root "$@"
+      load_os
+      show_runtime_status
       ;;
     *)
       usage >&2
